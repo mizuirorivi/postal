@@ -1,0 +1,38 @@
+{
+  "name": "opencode-postal",
+  "version": "0.1.0",
+  "description": "Session-to-session mail for OpenCode: @mentions, postal_send, Ctrl+P pairing, RPC, rally limits.",
+  "type": "module",
+  "bin": {
+    "opencode-postal": "./install.mjs"
+  },
+  "exports": {
+    ".": "./index.ts",
+    "./tui": "./tui.tsx",
+    "./rpc": "./rpc.ts"
+  },
+  "files": [
+    "index.ts",
+    "tui.tsx",
+    "rpc.ts",
+    "lock.ts",
+    "fuzzy.ts",
+    "install.mjs",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "plugin",
+    "session",
+    "mail",
+    "ai",
+    "agent"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mizuirorivi/postal.git"
+  }
+}
