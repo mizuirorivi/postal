@@ -67,6 +67,7 @@ mkdirSync(target, { recursive: true })
 for (const file of files) {
   cpSync(join(here, file), join(target, file))
 }
+cpSync(join(here, "skills"), join(target, "skills"), { recursive: true })
 
 const skillTarget = project
   ? join(resolve(project), ".opencode", "skills", "postal")
