@@ -1255,6 +1255,7 @@ describe("concurrency and sender scoping", () => {
     test.addSession("ses_a", "A")
     test.addSession("ses_b", "B")
     test.addSession("ses_c", "C")
+    await test.rpc.connect({ sessionID: "ses_c", peerID: "ses_b" })
     await test.tools.send.execute(
       { to: "ses_b", text: "old", msg_id: "msg_c_old" },
       { sessionID: "ses_c" },
@@ -1294,6 +1295,8 @@ describe("concurrency and sender scoping", () => {
     test.addSession("ses_a", "A")
     test.addSession("ses_b", "B")
     test.addSession("ses_c", "C")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.rpc.connect({ sessionID: "ses_c", peerID: "ses_b" })
     const first = await test.tools.send.execute(
       { to: "ses_b", text: "from a", msg_id: "msg_shared" },
       { sessionID: "ses_a" },
@@ -1314,6 +1317,7 @@ describe("outbox integrity", () => {
     const test = await boot()
     test.addSession("ses_a", "A")
     test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
     const original = test.context.storage.set
     let failed = false
     test.context.storage.set = async (key: string, value: unknown) => {
@@ -1334,6 +1338,7 @@ describe("outbox integrity", () => {
     const test = await boot()
     test.addSession("ses_a", "A")
     test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
     await test.tools.send.execute({ to: "ses_b", text: "hello", msg_id: "msg_delivered" }, { sessionID: "ses_a" })
     const before = test.prompts.length
     const retry = await test.tools.retry.execute({}, { sessionID: "ses_a" })
@@ -1346,6 +1351,7 @@ describe("outbox integrity", () => {
     const test = await boot()
     test.addSession("ses_a", "A")
     test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
     await test.tools.send.execute({ to: "ses_b", text: "hello", msg_id: "msg_gone" }, { sessionID: "ses_a" })
     const key = outboxKey("ses_a", "msg_gone")
     const record = test.storage.get(key) as any
@@ -1377,6 +1383,8 @@ describe("retry availability", () => {
     test.addSession("ses_a", "A")
     test.addSession("ses_b", "B")
     test.addSession("ses_c", "C")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_c" })
     await test.tools.send.execute({ to: "ses_b", text: "slow", msg_id: "msg_slow" }, { sessionID: "ses_a" })
     await test.tools.send.execute({ to: "ses_c", text: "fast", msg_id: "msg_fast" }, { sessionID: "ses_a" })
     for (const id of ["msg_slow", "msg_fast"]) {
@@ -1523,6 +1531,7 @@ describe("inbound receipts", () => {
     await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
     const b = [...test.sessions.values()].find((session) => session.title === "B")!
     test.addSession("ses_c", "C")
+    await test.rpc.connect({ sessionID: "ses_c", peerID: b.id })
     await test.tools.send.execute(
       { to: b.id, text: "task", kind: "task", task_id: "T1", msg_id: "msg_task_unauth" },
       { sessionID: "ses_c" },
@@ -1636,5 +1645,60 @@ describe("receipt cleanup", () => {
     expect(result.content).toContain("COUNT\t1")
     expect(test.storage.has(key)).toBe(false)
     expect(test.storage.has(receiptKey("ses_a", "ses_b", "msg_old_receipt"))).toBe(false)
+  })
+})
+
+describe("v2 delivery integrity", () => {
+  it("rejects an explicit send to an unpaired session", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    const result = await test.tools.send.execute(
+      { to: "ses_b", text: "hello", msg_id: "msg_unpaired" },
+      { sessionID: "ses_a" },
+    )
+    expect(result.content).toContain("not a paired peer")
+    expect(test.storage.has(outboxKey("ses_a", "msg_unpaired"))).toBe(false)
+    expect(test.prompts).toHaveLength(0)
+  })
+
+  it("rejects delivery after disconnect", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.rpc.disconnect({ sessionID: "ses_a", peerID: "ses_b" })
+    const result = await test.tools.send.execute(
+      { to: "ses_b", text: "hello", msg_id: "msg_after_disconnect" },
+      { sessionID: "ses_a" },
+    )
+    expect(result.content).toContain("not a paired peer")
+    expect(test.prompts).toHaveLength(0)
+  })
+
+  it("resolves an omitted recipient from paired peers only", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    test.addSession("ses_c", "C")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    const result = await test.tools.send.execute(
+      { text: "paired only", msg_id: "msg_paired_only" },
+      { sessionID: "ses_a" },
+    )
+    expect(result.content).toContain("delivered")
+    expect(test.prompts.at(-1)?.sessionID).toBe("ses_b")
+  })
+
+  it("requires an explicit recipient when multiple peers are paired", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    test.addSession("ses_c", "C")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_c" })
+    const result = await test.tools.send.execute({ text: "ambiguous", msg_id: "msg_ambiguous" }, { sessionID: "ses_a" })
+    expect(result.content).toContain("2 peers are paired")
+    expect(test.prompts).toHaveLength(0)
   })
 })

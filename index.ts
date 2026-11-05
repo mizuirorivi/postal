@@ -1898,17 +1898,21 @@ async function setup(ctx: PostalContext): Promise<void> {
         const replyTo = value.reply_to?.trim() || undefined
         const artifacts = normalizeArtifacts(value.artifacts)
         const commands = normalizeCommands(value.commands)
+        // R-01/R-02: only an active pair is a valid recipient. Never infer a
+        // target from a live session lookup; the pair is the authorization and
+        // the disconnect is the revocation point.
+        const pairedPeers = await readPeers(ctx, context.sessionID)
         if (!to) {
-          const status = await peerStatus(ctx, context.sessionID)
-          const peers = status.peers ?? []
-          if (peers.length === 1) {
-            to = peers[0]?.id
+          if (pairedPeers.length === 1) {
+            to = pairedPeers[0]?.id
             validated = true
-          } else if (peers.length > 1) {
-            const listing = peers.map((peer) => `${peer.id}${peer.title ? ` (${peer.title})` : ""}`).join(", ")
+          } else if (pairedPeers.length > 1) {
+            const listing = pairedPeers
+              .map((peer) => `${peer.id}${peer.title ? ` (${peer.title})` : ""}`)
+              .join(", ")
             return {
               content:
-                `postal: ${peers.length} peers are connected (${listing}). ` +
+                `postal: ${pairedPeers.length} peers are paired (${listing}). ` +
                 `Pass 'to' explicitly or call postal_peers for the list.`,
             }
           }
@@ -1916,11 +1920,16 @@ async function setup(ctx: PostalContext): Promise<void> {
         if (!to) {
           return {
             content:
-              "postal: no recipient (stale peers are cleaned automatically). " +
-              "Connect a peer with the Postal command (Ctrl+P), pass 'to' explicitly, or use postal_directory.",
+              "postal: no paired recipient. Connect a peer with the Postal command (Ctrl+P) " +
+              "or call postal_send with an explicitly paired session ID.",
           }
         }
         if (to === context.sessionID) return { content: "postal: cannot send mail to yourself" }
+        if (!pairedPeers.some((peer) => peer.id === to)) {
+          return {
+            content: `postal: recipient is not a paired peer: ${to}. Connect it first; disconnected sessions cannot receive mail.`,
+          }
+        }
         if (!validated) {
           try {
             await ctx.session.get({ sessionID: to })
@@ -2041,8 +2050,8 @@ async function setup(ctx: PostalContext): Promise<void> {
         if (!text) return { content: "postal: 'text' is required" }
         const kind = value.kind ? parseKind(value.kind) : undefined
         if (value.kind && !kind) return { content: `postal: invalid kind: ${value.kind}` }
-        const peers = (await peerStatus(ctx, context.sessionID)).peers ?? []
-        if (peers.length === 0) return { content: "postal: no connected peers" }
+        const peers = await readPeers(ctx, context.sessionID)
+        if (peers.length === 0) return { content: "postal: no paired peers" }
         const base = value.msg_id?.trim() || generateMsgID()
         const artifacts = normalizeArtifacts(value.artifacts)
         const commands = normalizeCommands(value.commands)
@@ -2277,14 +2286,14 @@ async function setup(ctx: PostalContext): Promise<void> {
       execute: async (input, context) => {
         let peerID = String((input as { peerID?: unknown }).peerID ?? "").trim()
         if (!peerID) {
-          const peers = (await peerStatus(ctx, context.sessionID)).peers ?? []
+          const peers = await readPeers(ctx, context.sessionID)
           if (peers.length === 1) peerID = peers[0]!.id
-          else if (peers.length === 0) return { content: "postal: no connected peers" }
-          else return { content: "postal: multiple peers connected; pass peerID explicitly" }
+          else if (peers.length === 0) return { content: "postal: no paired peers" }
+          else return { content: "postal: multiple peers paired; pass peerID explicitly" }
         }
-        const peers = (await peerStatus(ctx, context.sessionID)).peers ?? []
+        const peers = await readPeers(ctx, context.sessionID)
         if (!peers.some((peer) => peer.id === peerID)) {
-          return { content: `postal: peer not connected: ${peerID}` }
+          return { content: `postal: peer not paired: ${peerID}` }
         }
         const key = hmacStorageKey(context.sessionID, peerID)
         const result = await serialized(hmacLocks, key, async () => {
