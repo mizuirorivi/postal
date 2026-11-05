@@ -5,6 +5,8 @@ import {
   grantOperations,
   readSpawnFact,
   revokeOperations,
+  wouldCreateAuthorityCycle,
+  wouldCreateParentCycle,
   writeSpawnFact,
 } from "../grants.js"
 
@@ -81,5 +83,25 @@ describe("relation grants", () => {
       expiresAt: Date.now() - 1,
     })
     expect(allowedOperations(granted)).not.toContain("send")
+  })
+})
+
+describe("grant cycles", () => {
+  it("rejects parent and authority cycles but allows bidirectional send", async () => {
+    const { ctx, storage, lock } = fake()
+    storage.set("parent/ses_b", { parentID: "ses_a" })
+    storage.set("parent/ses_c", { parentID: "ses_b" })
+    expect(await wouldCreateParentCycle(ctx, "ses_a", "ses_c")).toBe(true)
+    expect(await wouldCreateParentCycle(ctx, "ses_c", "ses_a")).toBe(false)
+
+    storage.set("peers/ses_a", [{ id: "ses_b" }])
+    storage.set("peers/ses_b", [{ id: "ses_a" }])
+    await grantOperations(ctx, lock, "ses_a", "ses_b", ["task"])
+    await expect(grantOperations(ctx, lock, "ses_b", "ses_a", ["task"])).rejects.toThrow("authority cycle")
+    expect(await wouldCreateAuthorityCycle(ctx, "ses_b", "ses_a", ["task"])).toBe(true)
+
+    await grantOperations(ctx, lock, "ses_a", "ses_b", ["send"])
+    await grantOperations(ctx, lock, "ses_b", "ses_a", ["send"])
+    expect(await wouldCreateAuthorityCycle(ctx, "ses_a", "ses_b", ["send"])).toBe(false)
   })
 })

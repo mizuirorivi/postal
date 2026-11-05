@@ -37,6 +37,7 @@ import {
   OPERATIONS,
   readSpawnFact,
   revokeOperations,
+  wouldCreateParentCycle,
   writeSpawnFact,
   type Lock,
   type Operation,
@@ -367,8 +368,11 @@ async function readChildren(ctx: PostalContext, sessionID: string): Promise<stri
 }
 
 async function writeParent(ctx: PostalContext, childID: string, parentID: string): Promise<void> {
-  if (childID === parentID) return
+  if (childID === parentID) throw new Error("postal: relation cycle rejected (self-parent)")
   await crossProcessLock(ctx, "parent-tree", async () => {
+    if (await wouldCreateParentCycle(ctx, childID, parentID)) {
+      throw new Error(`postal: relation cycle rejected: ${childID} -> ${parentID}`)
+    }
     const previous = await readParent(ctx, childID)
     if (previous?.parentID && previous.parentID !== parentID) {
       const siblings = await readChildren(ctx, previous.parentID)

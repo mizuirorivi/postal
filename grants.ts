@@ -71,6 +71,7 @@ export class GrantError extends Error {
 }
 
 const GRANT_INDEX = "grants/index"
+const AUTHORITY_OPERATIONS: Operation[] = ["task", "spawn", "interrupt", "close", "approve"]
 
 export function grantKey(from: string, to: string): string {
   return `grants/${from}/${to}`
@@ -148,6 +149,60 @@ export async function writeSpawnFact(
   })
 }
 
+export async function readCurrentParent(ctx: GrantContext, childID: string): Promise<string | undefined> {
+  const parent = (await ctx.storage.get(`parent/${childID}`)) as { parentID?: unknown } | undefined
+  if (typeof parent?.parentID === "string" && parent.parentID) return parent.parentID
+  return (await readSpawnFact(ctx, childID))?.spawnedBy
+}
+
+export async function wouldCreateParentCycle(
+  ctx: GrantContext,
+  childID: string,
+  parentID: string,
+): Promise<boolean> {
+  if (childID === parentID) return true
+  let current = parentID
+  for (let depth = 0; depth < 64; depth += 1) {
+    if (current === childID) return true
+    const parent = await readCurrentParent(ctx, current)
+    if (!parent) return false
+    current = parent
+  }
+  return true
+}
+
+export async function wouldCreateAuthorityCycle(
+  ctx: GrantContext,
+  from: string,
+  to: string,
+  operations: Operation[],
+): Promise<boolean> {
+  if (!operations.some((operation) => AUTHORITY_OPERATIONS.includes(operation))) return false
+  if (from === to) return true
+  const index = await readGrantIndex(ctx)
+  const adjacency = new Map<string, string[]>()
+  for (const entry of index) {
+    const grant = await readGrantEntry(ctx, entry)
+    if (!grant) continue
+    if (!AUTHORITY_OPERATIONS.some((operation) => isRuleActive(grant.operations[operation], operation))) {
+      continue
+    }
+    const next = adjacency.get(grant.from) ?? []
+    if (!next.includes(grant.to)) next.push(grant.to)
+    adjacency.set(grant.from, next)
+  }
+  const stack = [to]
+  const seen = new Set<string>()
+  while (stack.length > 0) {
+    const current = stack.pop()!
+    if (current === from) return true
+    if (seen.has(current)) continue
+    seen.add(current)
+    for (const next of adjacency.get(current) ?? []) stack.push(next)
+  }
+  return false
+}
+
 export async function readGrant(ctx: GrantContext, from: string, to: string): Promise<RelationGrant | undefined> {
   const value = await ctx.storage.get(grantKey(from, to))
   if (!value || typeof value !== "object") return undefined
@@ -200,8 +255,12 @@ export async function grantOperations(
   options: { approvalRequired?: boolean; expiresAt?: number } = {},
 ): Promise<RelationGrant> {
   if (!operations.length) throw new GrantError("at least one operation is required")
-  return lock(grantKey(from, to), async () => {
-    const existing = await readGrant(ctx, from, to)
+  return lock("grants/authority", () =>
+    lock(grantKey(from, to), async () => {
+      if (await wouldCreateAuthorityCycle(ctx, from, to, operations)) {
+        throw new GrantError(`authority cycle rejected: ${from} -> ${to}`)
+      }
+      const existing = await readGrant(ctx, from, to)
     const defaults = existing ? existing.operations : await defaultsFor(ctx, from, to)
     if (!defaults) throw new GrantError(`${from} has no relation with ${to}`)
     const now = Date.now()
@@ -223,10 +282,11 @@ export async function grantOperations(
       updatedAt: now,
       ...(existing?.revokedAt ? { revokedAt: existing.revokedAt } : {}),
     }
-    await ctx.storage.set(grantKey(from, to), grant)
-    await addGrantIndex(ctx, lock, from, to)
-    return grant
-  })
+      await ctx.storage.set(grantKey(from, to), grant)
+      await addGrantIndex(ctx, lock, from, to)
+      return grant
+    }),
+  )
 }
 
 export async function revokeOperations(
@@ -291,10 +351,10 @@ async function isPaired(ctx: GrantContext, from: string, to: string): Promise<bo
 async function isAncestor(ctx: GrantContext, from: string, to: string): Promise<boolean> {
   let current = to
   for (let depth = 0; depth < 64; depth += 1) {
-    const spawn = await readSpawnFact(ctx, current)
-    if (!spawn?.spawnedBy) return false
-    if (spawn.spawnedBy === from) return true
-    current = spawn.spawnedBy
+    const parent = await readCurrentParent(ctx, current)
+    if (!parent) return false
+    if (parent === from) return true
+    current = parent
   }
   return false
 }
