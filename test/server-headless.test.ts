@@ -1778,3 +1778,57 @@ describe("v2 shared record serialization", () => {
     expect((status.peers ?? []).map((peer: any) => peer.id).sort()).toEqual(["ses_b", "ses_c"])
   })
 })
+
+describe("v2 relation grants", () => {
+  it("shows spawn defaults and supports grant/revoke", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+
+    const relationsA = await test.tools.relations.execute({}, { sessionID: "ses_a" })
+    expect(relationsA.content).toContain("SPAWNED_BY\t-")
+    expect(relationsA.content).toContain(`out\t${b.id}\tsend,task,interrupt,close,history`)
+
+    const relationsB = await test.tools.relations.execute({}, { sessionID: b.id })
+    expect(relationsB.content).toContain("SPAWNED_BY\tses_a")
+    expect(relationsB.content).toContain(`out\tses_a\tsend`)
+
+    const granted = await test.tools.grant.execute(
+      { to: b.id, operations: ["approve"], approvalRequired: true },
+      { sessionID: "ses_a" },
+    )
+    expect(granted.content).toContain("GRANTED")
+    expect((await test.tools.relations.execute({}, { sessionID: "ses_a" })).content).toContain("approve")
+
+    const revoked = await test.tools.revoke.execute(
+      { to: b.id, operations: ["task"] },
+      { sessionID: "ses_a" },
+    )
+    expect(revoked.content).toContain("revoked")
+    const after = await test.tools.relations.execute({}, { sessionID: "ses_a" })
+    const outLine = after.content.split("\n").find((line) => line.startsWith("out\t"))
+    expect(outLine).not.toContain("task")
+  })
+
+  it("rejects grants to unrelated sessions and uses send-only pair defaults", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    test.addSession("ses_c", "C")
+
+    const rejected = await test.tools.grant.execute(
+      { to: "ses_b", operations: ["send"] },
+      { sessionID: "ses_a" },
+    )
+    expect(rejected.content).toContain("grant failed")
+
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_c" })
+    const relations = await test.tools.relations.execute({}, { sessionID: "ses_a" })
+    const outLine = relations.content
+      .split("\n")
+      .find((line) => line.startsWith("out\t") && line.includes("ses_c"))
+    expect(outLine).toContain("send")
+    expect(outLine).not.toContain("task")
+  })
+})

@@ -27,7 +27,19 @@
 import { PostalRpc } from "./rpc.js"
 import { serialized } from "./lock.js"
 import { defaultLockStorePath, openLockStore } from "./state.js"
-import { ensureGrant, writeSpawnFact, type Lock } from "./grants.js"
+import {
+  allowedOperations,
+  ensureGrant,
+  grantOperations,
+  listGrants,
+  OPERATION_SPECS,
+  OPERATIONS,
+  readSpawnFact,
+  revokeOperations,
+  writeSpawnFact,
+  type Lock,
+  type Operation,
+} from "./grants.js"
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto"
 import { readFileSync, realpathSync, statSync } from "node:fs"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
@@ -1737,6 +1749,138 @@ async function setup(ctx: PostalContext): Promise<void> {
             `OUTBOX_REJECTED\t${outbox.filter((record) => record.status === "rejected").length}`,
             "PEER_ID\tTITLE\tRALLY_REMAINING\tLAST_LETTER\tRALLY_RESET_AT\tSTATE\tINBOX_COUNT\tPRESENCE_AT",
             ...rows,
+          ].join("\n"),
+        }
+      },
+    })
+
+    editor.add({
+      name: "grant",
+      description:
+        "Grant operations to a paired or spawned relation. The caller grants its own operations toward 'to'.",
+      input: {
+        type: "object",
+        properties: {
+          to: { type: "string", description: "Target session ID" },
+          operations: {
+            type: "array",
+            items: { type: "string", enum: [...OPERATIONS] },
+          },
+          approvalRequired: { type: "boolean" },
+          expiresAt: { type: "number", description: "Epoch milliseconds" },
+        },
+        required: ["to", "operations"],
+        additionalProperties: false,
+      },
+      execute: async (input, context) => {
+        const value = input as {
+          to?: string
+          operations?: unknown
+          approvalRequired?: boolean
+          expiresAt?: number
+        }
+        const to = value.to?.trim()
+        if (!to) return { content: "postal: 'to' is required" }
+        const operations = Array.isArray(value.operations)
+          ? value.operations.filter(
+              (operation): operation is Operation =>
+                typeof operation === "string" && (OPERATIONS as readonly string[]).includes(operation),
+            )
+          : []
+        if (operations.length === 0) return { content: "postal: at least one valid operation is required" }
+        try {
+          const grant = await grantOperations(ctx, stateLock(ctx), context.sessionID, to, operations, {
+            ...(typeof value.approvalRequired === "boolean" ? { approvalRequired: value.approvalRequired } : {}),
+            ...(typeof value.expiresAt === "number" ? { expiresAt: value.expiresAt } : {}),
+          })
+          return {
+            content: [
+              `GRANTED\t${to}`,
+              `OPERATIONS\t${operations.join(",")}`,
+              `UPDATED_AT\t${new Date(grant.updatedAt).toISOString()}`,
+            ].join("\n"),
+          }
+        } catch (error) {
+          return { content: `postal: grant failed: ${errorText(error)}` }
+        }
+      },
+    })
+
+    editor.add({
+      name: "revoke",
+      description: "Revoke operations from a relation. Omit operations to revoke all of them.",
+      input: {
+        type: "object",
+        properties: {
+          to: { type: "string" },
+          operations: {
+            type: "array",
+            items: { type: "string", enum: [...OPERATIONS] },
+          },
+        },
+        required: ["to"],
+        additionalProperties: false,
+      },
+      execute: async (input, context) => {
+        const value = input as { to?: string; operations?: unknown }
+        const to = value.to?.trim()
+        if (!to) return { content: "postal: 'to' is required" }
+        const operations = Array.isArray(value.operations)
+          ? value.operations.filter(
+              (operation): operation is Operation =>
+                typeof operation === "string" && (OPERATIONS as readonly string[]).includes(operation),
+            )
+          : undefined
+        const grant = await revokeOperations(ctx, stateLock(ctx), context.sessionID, to, operations)
+        if (!grant) return { content: `postal: no grant for ${to}` }
+        return { content: `postal: revoked ${operations?.join(",") ?? "all"} for ${to}` }
+      },
+    })
+
+    editor.add({
+      name: "relations",
+      description: "Show outgoing and incoming grants, spawn fact, enforceable flags, and approval requirements.",
+      input: {
+        type: "object",
+        properties: {
+          sessionID: { type: "string" },
+        },
+        additionalProperties: false,
+      },
+      execute: async (input, context) => {
+        const value = input as { sessionID?: string }
+        const target = value.sessionID?.trim() || context.sessionID
+        if (!(await canInspect(ctx, context.sessionID, target))) {
+          return { content: "postal: not authorized to inspect another session" }
+        }
+        const grants = await listGrants(ctx, target)
+        const spawn = await readSpawnFact(ctx, target)
+        const rows = grants.map((grant) => {
+          const direction = grant.from === target ? "out" : "in"
+          const peer = grant.from === target ? grant.to : grant.from
+          const allowed = allowedOperations(grant)
+          const enforceable = [...new Set(allowed.map((operation) => OPERATION_SPECS[operation].enforceable))].join(",")
+          const approval = allowed.filter((operation) => grant.operations[operation].approvalRequired)
+          const expiries = allowed
+            .map((operation) => grant.operations[operation].expiresAt)
+            .filter((value): value is number => typeof value === "number")
+          const expires = expiries.length > 0 ? new Date(Math.min(...expiries)).toISOString() : "-"
+          return [
+            direction,
+            peer,
+            allowed.join(",") || "-",
+            enforceable || "-",
+            approval.join(",") || "-",
+            expires,
+            grant.revokedAt ? "revoked" : "active",
+          ].join("\t")
+        })
+        return {
+          content: [
+            `SESSION_ID\t${target}`,
+            `SPAWNED_BY\t${spawn?.spawnedBy ?? "-"}`,
+            "DIRECTION\tPEER\tOPERATIONS\tENFORCEABLE\tAPPROVAL_REQUIRED\tEXPIRES\tSTATE",
+            ...(rows.length > 0 ? rows : ["(no grants)"]),
           ].join("\n"),
         }
       },
