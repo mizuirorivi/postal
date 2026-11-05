@@ -27,8 +27,8 @@
 import { PostalRpc } from "./rpc.js"
 import { serialized } from "./lock.js"
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto"
-import { existsSync, readFileSync } from "node:fs"
-import { dirname, join, resolve } from "node:path"
+import { readFileSync, realpathSync, statSync } from "node:fs"
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 
 type PromptEvent = {
@@ -246,15 +246,42 @@ function normalizeCommands(value: unknown): EnvelopeCommand[] {
   return commands
 }
 
+const MAX_ARTIFACT_BYTES = 1024 * 1024
+
+/** Resolve an artifact inside the project, rejecting absolute paths and symlink escapes. */
+function containedArtifactPath(ctx: PostalContext, artifactPath: string): string | undefined {
+  if (artifactPath.includes("\0")) return undefined
+  let root: string
+  let target: string
+  try {
+    root = realpathSync(ctx.location.directory)
+    target = realpathSync(resolve(ctx.location.directory, artifactPath))
+  } catch {
+    return undefined
+  }
+  const rel = relative(root, target)
+  if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return undefined
+  return target
+}
+
 function verifyArtifact(ctx: PostalContext, artifact: EnvelopeArtifact): string {
-  const path = resolve(ctx.location.directory, artifact.path)
-  if (!existsSync(path)) return `${artifact.path}: missing`
+  const path = containedArtifactPath(ctx, artifact.path)
+  if (!path) return `${artifact.path}: outside project or missing`
+  let stat: ReturnType<typeof statSync>
+  try {
+    stat = statSync(path)
+  } catch (error) {
+    return `${artifact.path}: unreadable (${errorText(error)})`
+  }
+  if (!stat.isFile()) return `${artifact.path}: not a regular file`
+  if (stat.size > MAX_ARTIFACT_BYTES) return `${artifact.path}: too large (${stat.size} bytes)`
   if (!artifact.sha256) return `${artifact.path}: exists`
+  if (!/^[0-9a-f]{64}$/i.test(artifact.sha256)) return `${artifact.path}: invalid sha256`
   try {
     const hash = createHash("sha256").update(readFileSync(path)).digest("hex")
     return hash.toLowerCase() === artifact.sha256.toLowerCase()
       ? `${artifact.path}: ok`
-      : `${artifact.path}: sha256 mismatch (expected ${artifact.sha256}, got ${hash})`
+      : `${artifact.path}: sha256 mismatch`
   } catch (error) {
     return `${artifact.path}: unreadable (${errorText(error)})`
   }

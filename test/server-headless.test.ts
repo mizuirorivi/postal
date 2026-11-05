@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test"
 import { createHash } from "node:crypto"
-import { mkdirSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "../index.js"
 
@@ -346,7 +347,7 @@ describe("structured postal envelope", () => {
     addSession("ses_b", "B")
     await rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
 
-    const dir = "/tmp/opencode/postal-envelope-test"
+    const dir = "/tmp/postal-test/postal-envelope-test"
     const path = join(dir, "artifact.txt")
     mkdirSync(dir, { recursive: true })
     writeFileSync(path, "evidence\n")
@@ -958,5 +959,55 @@ describe("watchdog and outbox cleanup", () => {
     expect(removed.content).toContain("COUNT\t1")
     expect(test.storage.has("outbox/msg_old_outbox")).toBe(false)
     expect((await test.tools.inbox.execute({}, { sessionID: "ses_a" })).content).not.toContain("msg_old_outbox")
+  })
+})
+
+describe("artifact containment", () => {
+  it("confines verification to regular files inside the project root", async () => {
+    const test = await boot()
+    const root = mkdtempSync(join(tmpdir(), "postal-artifacts-"))
+    test.context.location.directory = root
+    const outsideName = `postal-outside-${Date.now()}.txt`
+    const outside = join(root, "..", outsideName)
+    const inside = join(root, "inside.txt")
+    writeFileSync(inside, "inside")
+    writeFileSync(outside, "outside")
+    symlinkSync("/etc/hostname", join(root, "escape.txt"))
+    writeFileSync(join(root, "big.bin"), Buffer.alloc(1024 * 1024 + 1))
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+
+    const sha = createHash("sha256").update("inside").digest("hex")
+    const hostHash = createHash("sha256").update(readFileSync("/etc/hostname")).digest("hex")
+    await test.tools.send.execute(
+      {
+        to: "ses_b",
+        text: "artifact probe",
+        msg_id: "msg_artifacts",
+        artifacts: [
+          { path: "inside.txt", sha256: sha },
+          { path: `../${outsideName}` },
+          { path: "/etc/hostname" },
+          { path: "escape.txt" },
+          { path: "big.bin" },
+          { path: "inside.txt", sha256: "deadbeef" },
+        ],
+      },
+      { sessionID: "ses_a" },
+    )
+
+    const text = test.prompts.at(-1)!.text
+    expect(text).toContain("inside.txt: ok")
+    expect(text).toContain(`../${outsideName}: outside project or missing`)
+    expect(text).toContain("/etc/hostname: outside project or missing")
+    expect(text).toContain("escape.txt: outside project or missing")
+    expect(text).toContain("big.bin: too large")
+    expect(text).toContain("inside.txt: invalid sha256")
+    expect(text).not.toContain("got ")
+    expect(text).not.toContain(hostHash)
+
+    rmSync(outside, { force: true })
+    rmSync(root, { recursive: true, force: true })
   })
 })
