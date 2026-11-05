@@ -33,7 +33,7 @@ its own model, agent, permissions, and tab.
 - Persistent outbox with retry + ACK (`postal_inbox`, `postal_resend`, `postal_retry`)
 - Relation grants (`postal_grant` / `postal_revoke` / `postal_relations`) for send/task/spawn/interrupt/close/history/approve
 - Per-relation delivery modes (`interrupt` / `idle` / `inbox`)
-- Task state separate from message ACK (`postal_task`), plus `request` vs `assignment` kinds
+- Task state separate from message ACK (`postal_task_state`), plus `request` vs `assignment` kinds
 - `postal_tree` parent/child/ancestor view with spawn facts and grants
 - Advisory claims (`postal_claim` / `postal_release`)
 - Agent lifecycle (`postal_interrupt`, `postal_close`) with grant checks, and `postal_broadcast`
@@ -234,7 +234,7 @@ Every `postal_send` writes a sender-scoped outbox record before delivery:
   stopped and an open assignment task is cancelled
 - `failed`: all retry attempts were exhausted
 
-Task work state is separate from message state: `postal_task` moves a task
+Task work state is separate from message state: `postal_task_state` moves a task
 through `open`, `in_progress`, `blocked`, `done`, or `cancelled`. An ACK does not
 complete a task, and a completed task stops watchdog nudges. `postal_inbox`
 shows `TASK_STATUS` next to the message status.

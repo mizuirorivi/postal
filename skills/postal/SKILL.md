@@ -102,7 +102,7 @@ malicious tasks; permissions remain the real boundary.
   `rejected` (the receiver rejected the envelope; reason in `lastError`),
   `revoked` (the relation revoked send/task), `acked` (the peer replied with
   `reply_to`), and `failed`.
-- Task state is separate from message ACK: `postal_task` moves a task through
+- Task state is separate from message ACK: `postal_task_state` moves a task through
   `open`, `in_progress`, `blocked`, `done`, or `cancelled`. ACK does not complete
   a task; `done`/`cancelled` stop watchdog nudges.
 - Admission alone is not an ACK. A reply that includes `reply_to: <msg_id>`

@@ -87,7 +87,7 @@ type TaskRecord = {
 - Index: `task/index` under the cross-process lock.
 - Created when a `task`/`assignment` letter is sent; the receiver confirms the
   task record on admission (same taskID).
-- `postal_task({ task_id, status, note? })` updates it. Allowed: the assigner
+- `postal_task_state({ task_id, status, note? })` updates it. Allowed: the assigner
   (`from`), the assignee (`to`), or an `approve` holder.
 - ACK, delivery, and rejection do not change task status.
 - `postal_inbox`/`postal_status` show `TASK_STATUS` separately from message
@@ -136,7 +136,7 @@ force an assignment on the parent.
 
 - Existing grants gain `delivery: "interrupt"` on first read; no behavior change.
 - Existing `kind: "task"` letters are treated as assignments.
-- Existing task-less outbox records have no task state; `postal_task` can create
+- Existing task-less outbox records have no task state; `postal_task_state` can create
   one on demand.
 - `allowAncestorCommands` migration remains M1-only; runtime uses grants.
 - The host's `delivery: "queue"` contract must be verified in a spike; if the
@@ -146,7 +146,7 @@ force an assignment on the parent.
 
 - Delivery: interrupt → steer; inbox → queue; idle with idle presence → steer;
   idle with running/unknown → queue; relation policy persists and is shown.
-- Task state: send assignment → open; ACK does not close; `postal_task
+- Task state: send assignment → open; ACK does not close; `postal_task_state
   in_progress/done` transitions; watchdog stops after done; cancelled assignment
   stops nudges.
 - Request/assignment: request allowed with send only; assignment denied without

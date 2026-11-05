@@ -2078,7 +2078,7 @@ async function setup(ctx: PostalContext): Promise<void> {
     })
 
     editor.add({
-      name: "task",
+      name: "task_state",
       description:
         "Update a task's work state (open/in_progress/blocked/done/cancelled). " +
         "Message ACK and task completion are separate.",

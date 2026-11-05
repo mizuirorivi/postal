@@ -2006,7 +2006,7 @@ describe("v2 task state", () => {
     expect(acked.content).toContain("acked")
     expect(acked.content).toContain("open")
 
-    const done = await test.tools.task.execute({ task_id: "T1", status: "done" }, { sessionID: "ses_a" })
+    const done = await test.tools.task_state.execute({ task_id: "T1", status: "done" }, { sessionID: "ses_a" })
     expect(done.content).toContain("STATUS\tdone")
     expect((await test.tools.inbox.execute({}, { sessionID: "ses_a" })).content).toContain("done")
   })
@@ -2021,7 +2021,7 @@ describe("v2 task state", () => {
       { to: b.id, text: "task", kind: "task", task_id: "T1", msg_id: "msg_task_done" },
       { sessionID: "ses_a" },
     )
-    await test.tools.task.execute({ task_id: "T1", status: "done" }, { sessionID: "ses_a" })
+    await test.tools.task_state.execute({ task_id: "T1", status: "done" }, { sessionID: "ses_a" })
     const watchdog = await test.tools.watchdog.execute({ afterSeconds: 0 }, { sessionID: "ses_a" })
     expect(watchdog.content).not.toContain("msg_task_done")
     expect(watchdog.content).toContain("NUDGED\t-")
@@ -2037,7 +2037,7 @@ describe("v2 task state", () => {
       { to: b.id, text: "task", kind: "task", task_id: "T1", msg_id: "msg_task_owner" },
       { sessionID: "ses_a" },
     )
-    const denied = await test.tools.task.execute({ task_id: "T1", status: "done" }, { sessionID: "ses_c" })
+    const denied = await test.tools.task_state.execute({ task_id: "T1", status: "done" }, { sessionID: "ses_c" })
     expect(denied.content).toContain("task not found")
   })
 })
