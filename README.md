@@ -1,8 +1,8 @@
 # Postal — session-to-session mail for OpenCode
 
-Postal turns separate OpenCode sessions into a small mail network. Pair two
-sessions, then let their AIs talk — or send a letter from a human prompt with
-`@ses_...`.
+Postal turns separate OpenCode sessions into a small mail network. Connect one
+or more peer sessions, then let their AIs talk — or send a letter from a human
+prompt with `@ses_...`.
 
 No subagents, no shared context, no parent-child hierarchy. Each session keeps
 its own model, agent, permissions, and tab.
@@ -18,19 +18,31 @@ its own model, agent, permissions, and tab.
 - **Zero dependencies.** TypeScript sources are loaded directly by OpenCode. No
   build step, no npm dependencies.
 - **Works with your setup.** Mention mode for humans, tool mode for agents, and
-  Ctrl+P commands for pairing.
+  Ctrl+P commands for connecting peers.
 
 ## Features
 
-- `@ses_XXXX <message>` mention delivery with reply relay
+- `@ses_XXXX <message>` mention delivery that returns immediately
 - `postal_send` tool for AI-to-AI letters (non-blocking)
-- `postal_directory` tool to list sessions
-- Ctrl+P commands: connect, disconnect, show pair, reset rally
-- Reply tokens so a mention reply is matched to the right letter
+- `postal_directory`, `postal_peers`, and `postal_spawn` tools for address discovery and worker creation
+- Structured envelopes (`kind`, `task_id`, `reply_to`, artifacts, commands, `msg_id`)
+- `postal_status` (rally budget / last letter / busy-idle / inbox count) and `postal_log` (postal audit)
+- TUI presence bridge for live busy/idle and pending-inbox metadata
+- Artifact existence + sha256 verification on `verify` letters
+- Persistent outbox with retry + ACK (`postal_inbox`, `postal_resend`)
+- Advisory claims (`postal_claim` / `postal_release`)
+- Agent lifecycle (`postal_interrupt`, `postal_close`) with a spawn-parent allowlist, and `postal_broadcast`
+- Multiple connected peers per session
+- Ctrl+P commands: new session, connect, close session, disconnect peers, show
+  connected peers, reset rally
 - Shared per-conversation rally counter (default 30 letters / 10 minutes)
-- RPC (`postal.connect` / `postal.disconnect`) for exact TUI feedback
+- RPC (`postal.connect` / `postal.disconnect` / `postal.status`) for exact TUI
+  feedback
 - Fuzzy session picker sorted by recency
-- Current session title + ID in the prompt footer
+- Current session title + ID in the prompt footer, including an explicit
+  placeholder while a new session has no ID yet
+- Connected peers are green in the session picker and in the footer's
+  `→ peers` segment
 
 ## Quick start
 
@@ -109,11 +121,12 @@ Type a normal prompt with a session ID:
 @ses_abc123 Please review the changes in src/foo.ts and reply with the risks.
 ```
 
-Postal forwards the message to `ses_abc123`, waits for its reply, and admits the
-reply back to your session as:
+Postal forwards the message to `ses_abc123` immediately and returns. The
+receiving session replies with `postal_send`, which starts your next turn.
+There is no blocking wait and no queued reply in your inbox:
 
 ```text
-[postal reply from ses_abc123 (reviewer)]
+[postal] from ses_abc123 (reviewer) (rally 1/30)
 ...
 ```
 
@@ -122,24 +135,169 @@ reply back to your session as:
 Ask an agent to use the tools:
 
 ```text
-Use postal_directory to find the reviewer session, then postal_send a summary
-of the current diff and ask for a review.
+Use postal_peers to see my connected peers. If there is one, postal_send a
+summary of the current diff; if there are several, pass the target with 'to'.
 ```
 
 `postal_send` returns immediately. The peer receives a `[postal]` letter and can
-continue the conversation by calling `postal_send` again. Omit `to` to write to
-the peer connected via Ctrl+P.
+continue the conversation by calling `postal_send` again. Omit `to` only when
+exactly one peer is connected; with multiple peers, `postal_send` lists them so
+you can choose. `postal_directory` lists every session in the project.
+
+### AI: spawn a worker
+
+`postal_spawn` creates a session from an agent, so no CLI or database lookup is
+needed:
+
+```text
+postal_spawn({
+  title: "Worker",
+  model: "opencode-go/deepseek-v4.1-flash#max",
+  agent: "build",
+  directory: "/path/to/project",
+  autoPair: true
+})
+-> spawned ses_... and paired
+```
+
+The new session is idle until you send it a letter with `postal_send`. `model`
+uses `provider/model` with an optional `#variant`; `autoPair` defaults to `true`.
+
+### Structured envelope
+
+`postal_send` accepts an optional envelope so progress can be checked without
+re-parsing prose:
+
+```jsonc
+postal_send({
+  to: "ses_worker",
+  kind: "task",              // task | status | verify | error | letter
+  task_id: "T1",
+  reply_to: "T0",
+  msg_id: "msg_phase1",      // idempotency key; generated when omitted
+  text: "Phase 1 complete",
+  artifacts: [{ path: "src/foo.ts", sha256: "..." }],
+  commands: [{ cmd: "bun test", exit: 0 }]
+})
+```
+
+The receiver sees the body plus a machine-readable `--- postal envelope ---`
+section. For any letter with artifacts, Postal adds a `verification:` section
+with `ok` / `missing` / `sha256 mismatch`. Commands are reported, not re-run.
+A retried `msg_id` is not delivered twice.
+
+`postal_status` shows connected peers, remaining rally budget, last letter
+time, live `STATE` (idle/running), `INBOX_COUNT`, and the presence timestamp.
+`postal_inbox` combines the outbox with each peer's pending-inbox metadata
+(item ID, type, and source session only). `postal_log` returns recent `[postal]`
+messages from a transcript for audit.
+
+Presence is published by the TUI every five seconds for the focused session and
+its peers. It expires after 30 seconds; a headless or closed TUI shows
+`unknown`. Message bodies are not published by this bridge.
+
+### Delivery reliability
+
+Every `postal_send` writes an outbox record before delivery:
+
+- successful delivery: `delivered`
+- failed delivery: retried after 1s, 2s, 4s, … up to 6 attempts
+- reply with `reply_to: <msg_id>`: marks the original letter `acked`
+
+Use `postal_inbox` to inspect the outbox and `postal_resend` to force a retry.
+This is a delivery queue, not the AI's pending inbox. When the rally limit is
+reached, pass `queueOnLimit: true` to retry after the window instead of
+rejecting the letter.
+
+### Claims and lifecycle
+
+`postal_claim({ scope, ttl })` takes an advisory lock for a path or task.
+Re-claim to heartbeat; `postal_release({ scope })` releases it. Claims are
+coordination hints, not filesystem enforcement.
+
+`postal_interrupt` interrupts a running session. `postal_close` deletes another
+session and disconnects its peers. Both are restricted to the session that
+spawned the target (the direct parent); set `allowAncestorCommands: true` to
+let any ancestor use them. When a parent is closed, its children are reparented
+to the grandparent (or become unowned if there is no grandparent), so they are
+not orphaned. `orphanPolicy` controls this: `reparent` (default, notifies the
+grandparent with a `kind: "system"` letter), `terminate` (stops and deletes the
+descendant subtree), or `detach` (removes parent links; nobody can close the
+orphan). `postal_status` shows `SESSION_PARENT`.
+
+`postal_broadcast` sends one letter to every connected peer with per-peer outbox
+and rally accounting.
+
+### Reliability tradeoffs
+
+- **Outbox storage** is the plugin KV table. It is per-location, not a global
+  distributed queue; cross-project delivery still relies on the target being
+  reachable.
+- **ACK** is application-level: the receiver must include `reply_to: msg_id`.
+  There is no transport-level acknowledgement from the model runtime.
+- **Claims** are advisory; a rogue worker can ignore them. Filesystem
+  permissions remain the real enforcement boundary.
+- **Commander allowlist** covers lifecycle operations only (interrupt/close),
+  not mail. A manually created session has no parent, so agents cannot close
+  it; use the TUI. Deleting a parent from the TUI (outside Postal) can leave
+  child parent records pointing at a missing session.
+- **Grandchild policy**: direct parent only by default. `allowAncestorCommands`
+  opt-in permits any ancestor. `orphanPolicy` decides what happens on parent
+  close: `reparent` (default; notifies the grandparent and may wake its AI),
+  `terminate` (destructive auto-close of the subtree), or `detach` (orphans
+  cannot be closed by anyone).
+- **Retries** use a 15-second scanner, six attempts, and exponential backoff up
+  to five minutes. Delivered/acked records are kept for idempotency and audit;
+  prune them if the outbox grows.
+- **`postal_status`** sees busy/idle only while a TUI is publishing presence
+  for that session or one of its peers. Headless sessions show `unknown`.
+  Presence is TUI-sourced and expires after 30 seconds.
+- **Presence payload**: only item IDs, types, and source session IDs cross the
+  TUI→server bridge; message bodies stay in the TUI. Body previews are an
+  explicit future opt-in.
+- **Trust boundary**: any paired peer can send a `task` letter. HMAC signatures
+  and commander allowlists are not implemented yet; pair only trusted sessions
+  and use permissions/separate projects for isolation.
 
 ### Ctrl+P commands
 
 | Command | What it does |
 |---|---|
-| `Postal: Select peer session` | Pair the current (or selected) session with a peer |
-| `Postal: Disconnect pair` | Remove the pairing on both sides |
-| `Postal: Show current pair` | Show the connected peer |
+| `Postal: New session` | Create a named session, open it in a tab, and make its ID readable immediately |
+| `Postal: Select peer session` | Connect the current (or selected) session to another peer |
+| `Postal: Close session` | Close the tab, or permanently delete the session after confirmation |
+| `Postal: Disconnect peers` | Disconnect one peer, or every peer |
+| `Postal: Show connected peers` | Show every peer connected to the session |
 | `Postal: Reset rally` | Reset the shared rally counter |
 
 The picker sorts sessions by recency and uses fuzzy search over titles and IDs.
+
+### Session IDs at the start of a session
+
+OpenCode creates a server-side session only when the first prompt is submitted.
+Before that, the built-in new-session screen has no `ses_...` ID or title to
+read, so the Postal footer shows:
+
+```text
+new session · ID assigned on first message
+```
+
+Use `Postal: New session` when you want a real ID and name before typing: the
+command creates the session immediately, asks for an optional name, and opens
+it in a new tab. `Postal: Close session` can then close just that tab or delete
+the session (and all of its postal peers).
+
+When the current session has connected peers, the footer appends them and
+colors just that segment green, for example:
+
+```text
+Reviewer · ses_abc123 → Implementer, Tester
+```
+
+The peer entries are also green in the session picker, and the connected-peers
+dialog shows each peer name in green. The state comes from `postal.status`, so
+it also appears after a restart or when the peers were connected from another
+TUI instance.
 
 ## How it works
 
@@ -149,15 +307,24 @@ Session A ── @ses_B / postal_send ──▶ Postal ──▶ Session B
     └──────────── reply / next rally ──────────────┘
 ```
 
-- **Mention mode** runs on prompt admission. It forwards the text, waits for a
-  reply token, and queues the reply in the sender's transcript.
+- **Mention mode** runs on prompt admission. It forwards the text with `steer`
+  and returns immediately. The receiver answers with `postal_send`, which starts
+  the sender's next turn; no reply is parked in the sender's inbox.
 - **Tool mode** delivers with `steer` so an idle target starts immediately. The
   receiving AI replies with another `postal_send`.
+- **Worker creation** uses `ctx.session.create` with the requested title,
+  model, agent, directory, and permissions. `autoPair` connects the new
+  session in both directions before returning its ID.
+- **Multiple peers** are stored as an array per session
+  (`peers/<sessionID>`). Connecting a new peer preserves the existing ones;
+  `postal_send` without `to` requires exactly one peer.
 - **Rally counter** is keyed by the sorted session pair
   (`rally/<min>:<max>`) and shared by both sides. It defaults to 30 letters per
-  10-minute window and refuses sends beyond that.
-- **Pairing** is stored in the plugin `kv` table (`peer/<sessionID>`) and taught
-  to both sessions.
+  10-minute window (both configurable) and refuses sends beyond that unless
+  `queueOnLimit` delays them through the outbox.
+- **Pairing** is stored in the plugin `kv` table (`peers/<sessionID>`) and
+  taught to both sessions. The old single-peer `peer/<sessionID>` record is
+  migrated on first read.
 
 ## Configuration
 
@@ -169,14 +336,22 @@ Pass plugin options with the object form:
   "plugins": [
     {
       "package": "github:mizuirorivi/postal",
-      "options": { "maxRally": 10 }
+      "options": {
+        "maxRally": 10,
+        "rallyWindowMinutes": 10,
+        "allowAncestorCommands": false,
+        "orphanPolicy": "reparent"
+      }
     }
   ]
 }
 ```
 
-`maxRally` is the per-conversation letter limit (default 30). The 10-minute
-window and the reply-token timeout are fixed.
+`maxRally` is the per-conversation letter limit (default 30).
+`rallyWindowMinutes` is the rolling window (default 10). Both are per-pair.
+`allowAncestorCommands` lets any ancestor interrupt/close a descendant; the
+default is direct-parent only. `orphanPolicy` is `reparent` (default),
+`terminate`, or `detach`.
 
 ## Security model
 
@@ -190,25 +365,27 @@ to a peer. The rally limit bounds volume, not content. Mitigations:
 - Require approval (or deny) for `postal_send` via the agent's tool permission
   rules.
 - Pair only with sessions you trust; disconnect when done
-  (`Postal: Disconnect pair`).
+  (`Postal: Disconnect peers`).
 - Do not pair sessions that ingest untrusted external content with sessions
   that have powerful tool access.
 
 **Audit.** Pairing and rally state live in the plugin `kv` table
-(`peer/<sessionID>`, `rally/<pair>`). Letters and replies are in the session
+(`peers/<sessionID>`, `rally/<pair>`). Letters and replies are in the session
 transcripts; plugin failures are logged by the server. Review these when
 investigating unexpected mail.
 
 ## Troubleshooting
 
 - **Plugin not listed** — run `/reload`; check `opencode plugin list`.
-- **`postal: no recipient`** — no peer is connected, or the peer session was
-  deleted. Run `Postal: Select peer session`.
-- **`postal: rally limit reached`** — wait for the 10-minute window or run
-  `Postal: Reset rally`.
-- **Peer notes appear queued** — this runtime lacks
-  `ctx.session.instructions.entry`, so the pairing note is delivered as a queued
-  context message by design.
+- **`postal: no recipient`** — no peer is connected, or every connected peer was
+  deleted. Run `Postal: Select peer session`, or pass `to` explicitly.
+- **`n peers are connected`** — `postal_send` needs `to` when more than one peer
+  is connected. Run `postal_peers` to list them.
+- **`postal: rally limit reached`** — wait for the window, pass
+  `queueOnLimit: true`, or run `Postal: Reset rally`.
+- **Peer notes are missing** — this runtime does not expose
+  `ctx.session.instructions.entry`; Postal deliberately skips the note instead
+  of creating a queued message. The letter itself still includes the sender ID.
 - **RPC is unavailable** — the TUI falls back to the prompt handshake; check the
   plugin is active for the current location.
 
@@ -217,15 +394,25 @@ investigating unexpected mail.
 The plugin is a local OpenCode plugin with no build step:
 
 ```text
-index.ts    server part: tools, prompt hook, RPC, pairing, rally
+index.ts    server part: tools, prompt hook, RPC, multi-peer pairing, rally
 tui.tsx     Ctrl+P commands, session picker, footer status
-rpc.ts      postal.connect / postal.disconnect contract
+sessions.ts session create/close/delete flow (testable without OpenTUI)
+status.ts   route/session identity for the footer, including new-session state
+rpc.ts      postal.connect / postal.disconnect / postal.status contract
 lock.ts     per-conversation serialization for rally increments
 fuzzy.ts    fuzzy matcher for the session picker
+test/       Bun tests for multi-peer storage, async delivery, session lifecycle,
+            and footer identity
 skills/postal/SKILL.md  agent-facing usage guide
 ```
 
-To test changes, place the directory under `.opencode/plugins/postal/` in a
+Run the tests with:
+
+```sh
+bun test
+```
+
+To test UI changes, place the directory under `.opencode/plugins/postal/` in a
 project and run `/reload`.
 
 ## Runtime notes
@@ -234,7 +421,8 @@ project and run `/reload`.
   registration fails with `Object.entries requires that input parameter not be
   null or undefined`.
 - `ctx.session.instructions.entry` is not available in this runtime; peer notes
-  fall back to a queued context message.
+  are skipped rather than queued. Every letter includes the sender's session ID
+  so a reply can always pass `to` explicitly.
 - RPC calls from the HTTP API need the location query, e.g.
   `POST /api/rpc/postal/connect?location[directory]=/path/to/project`.
 
