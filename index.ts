@@ -70,6 +70,7 @@ import {
   readApproval,
   rejectApproval,
   type ApprovalOperation,
+  type ApprovalRecord,
 } from "./approvals.js"
 import {
   forwardQuestion,
@@ -2692,7 +2693,7 @@ async function setup(ctx: PostalContext): Promise<void | (() => void)> {
       },
       execute: async (input, context) => {
         const status = (input as { status?: string }).status
-        const approvals = []
+        const approvals: ApprovalRecord[] = []
         for (const record of await listApprovals(ctx)) {
           if (record.proposer === context.sessionID || record.approver === context.sessionID) {
             approvals.push(record)
