@@ -61,6 +61,7 @@ function harness() {
       }
       return undefined
     },
+    isPaired: async () => true,
     postLetter: async (input) => {
       letters.push(input)
       return { msgID: input.msgID ?? "msg_generated" }
@@ -88,7 +89,7 @@ const form: FormInfo = {
   id: "form_1",
   sessionID: "ses_child",
   title: "Pick a database",
-  metadata: { kind: "question" },
+  metadata: { kind: "question", tool: { id: "tool_1", messageID: "msg_1" } },
   fields: [{ key: "q0", type: "string", required: true }],
 }
 
@@ -120,6 +121,15 @@ describe("question forwarding", () => {
     expect(
       await forwardQuestion(test.ctx, test.deps, { ...form, metadata: { kind: "mcp" } }),
     ).toMatchObject({ status: "ignored", reason: "not_question" })
+    expect(
+      await forwardQuestion(test.ctx, test.deps, { ...form, metadata: { kind: "question" } }),
+    ).toMatchObject({ status: "ignored", reason: "not_question" })
+    expect(
+      await forwardQuestion(test.ctx, test.deps, { ...form, id: "bad id" }),
+    ).toMatchObject({ status: "ignored", reason: "invalid_form" })
+    expect(
+      await forwardQuestion(test.ctx, { ...test.deps, isPaired: async () => false }, form),
+    ).toMatchObject({ status: "ignored", reason: "not_paired" })
 
     clearParent(test, "ses_child")
     expect(await forwardQuestion(test.ctx, test.deps, form)).toMatchObject({

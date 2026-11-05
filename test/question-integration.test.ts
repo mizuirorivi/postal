@@ -145,7 +145,7 @@ function questionEvent(id: string, kind = "question") {
         id,
         sessionID: "ses_child",
         title: "Pick a database",
-        metadata: { kind },
+        metadata: { kind, tool: { id: "tool_1", messageID: "msg_1" } },
         fields: [{ key: "q0", type: "string", required: true }],
       },
     },
@@ -190,6 +190,8 @@ describe("question envelope and bridge", () => {
     expect(test.prompts).toHaveLength(1)
     expect(test.prompts[0]).toMatchObject({ sessionID: "ses_parent", delivery: "steer" })
     expect(test.prompts[0].metadata?.postal?.kind).toBe("question")
+    expect(test.prompts[0].text).toContain("postal_answer")
+    expect(test.prompts[0].text).not.toContain("Reply with postal_send")
 
     const answered = await test.tools.answer.execute(
       { form_id: "form_1", answer: { q0: "postgres" } },
@@ -244,4 +246,17 @@ describe("question envelope and bridge", () => {
     expect(denied.content).toContain("not an ancestor")
     test.cleanup?.()
   })
+  it("skips cross-location events and over-limit question letters", async () => {
+    const test = await boot()
+    test.events.push({ ...questionEvent("form_loc"), location: { directory: "/elsewhere" } })
+    await flush()
+    expect(test.prompts).toHaveLength(0)
+
+    test.storage.set("rally/ses_child:ses_parent", { count: 30, at: Date.now() })
+    test.events.push(questionEvent("form_rally"))
+    await flush()
+    expect(test.prompts).toHaveLength(0)
+    test.cleanup?.()
+  })
+
 })

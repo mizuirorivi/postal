@@ -870,9 +870,12 @@ async function postOnly(
     ...(envelope.replyTo ? [`[reply_to: ${envelope.replyTo}]`] : []),
   ].join(" ")
   const instructions =
-    `(Session mail. Reply with postal_send and pass to: ${options.from}. ` +
-    `If replying to this letter, also pass reply_to: ${envelope.msgID}. ` +
-    `You may omit 'to' only when exactly one peer is connected. A normal text reply is not delivered.)`
+    envelope.kind === "question"
+      ? `(Session mail. This is a blocking question. Answer with postal_answer({ form_id, answer }) ` +
+        `from your session; do not reply with postal_send. If the form is already settled, ignore this letter.)`
+      : `(Session mail. Reply with postal_send and pass to: ${options.from}. ` +
+        `If replying to this letter, also pass reply_to: ${envelope.msgID}. ` +
+        `You may omit 'to' only when exactly one peer is connected. A normal text reply is not delivered.)`
   let letter = `${header}\n${instructions}\n\n${options.body}`
 
   const verification = envelope.artifacts.map((artifact) => verifyArtifact(ctx, artifact))
@@ -1867,13 +1870,18 @@ function formsDeps(ctx: PostalContext): FormsDeps {
       (await readParent(target as unknown as PostalContext, sessionID))?.parentID,
     authorizingAncestor: async (target, actor, sessionID) =>
       authorizingAncestor(target as unknown as PostalContext, actor, sessionID),
+    isPaired: async (target, from, to) =>
+      (await readPeers(target as unknown as PostalContext, from)).some((peer) => peer.id === to),
     postLetter: async (input) => {
+      const rally = await nextRally(ctx, input.from, input.to)
+      const max = maxRally(ctx)
+      if (rally > max) throw new Error(`rally limit reached (${max} letters)`)
       const envelope = await postOnly(ctx, {
         from: input.from,
         to: input.to,
         body: input.body,
-        rally: await nextRally(ctx, input.from, input.to),
-        max: maxRally(ctx),
+        rally,
+        max,
         envelope: { kind: input.kind, msgID: input.msgID, replyTo: input.replyTo },
         delivery: input.delivery,
       })
@@ -1890,19 +1898,26 @@ function startFormBridge(ctx: PostalContext): () => void {
   const events = (
     ctx as unknown as {
       event?: {
-        subscribe?: (input: { types: string[] }) => AsyncIterable<{ type: string; data?: any }>
+        subscribe?: (
+          input: { types: string[] },
+        ) => AsyncIterable<{ type: string; data?: any; location?: { directory?: string } }>
       }
     }
   ).event
   if (ctx.options?.questionBridge === false || !events?.subscribe) return () => {}
   const controller = new AbortController()
   const deps = formsDeps(ctx)
+  const iterator = events.subscribe({
+    types: ["form.created", "form.replied", "form.cancelled"],
+  })[Symbol.asyncIterator]()
+  const location = ctx.location?.directory
   void (async () => {
     try {
-      for await (const event of events.subscribe({
-        types: ["form.created", "form.replied", "form.cancelled"],
-      })) {
-        if (controller.signal.aborted) break
+      for (;;) {
+        const next = await iterator.next()
+        if (next.done || controller.signal.aborted) break
+        const event = next.value
+        if (event.location?.directory && location && event.location.directory !== location) continue
         try {
           if (event.type === "form.created") {
             await forwardQuestion(ctx as FormsContext, deps, event.data?.form)
@@ -1921,7 +1936,10 @@ function startFormBridge(ctx: PostalContext): () => void {
       }
     }
   })()
-  return () => controller.abort()
+  return () => {
+    controller.abort()
+    void iterator.return?.().catch(() => {})
+  }
 }
 
 async function setup(ctx: PostalContext): Promise<void | (() => void)> {

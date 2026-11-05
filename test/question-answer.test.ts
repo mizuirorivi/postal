@@ -60,6 +60,7 @@ function harness() {
       }
       return undefined
     },
+    isPaired: async () => true,
     postLetter: async (input) => ({ msgID: input.msgID ?? "msg_generated" }),
     env: {},
     home: "/nonexistent-postal-test-home",
@@ -158,10 +159,10 @@ describe("postal_answer", () => {
     expect(record?.settlingBy).toBeUndefined()
   })
 
-  it("refuses to race another answerer", async () => {
+  it("refuses to race another answerer, including the same actor", async () => {
     const test = harness()
     const stored = test.storage.get(questionKey("form_1")) as Record<string, unknown>
-    test.storage.set(questionKey("form_1"), { ...stored, settlingBy: "ses_grand" })
+    test.storage.set(questionKey("form_1"), { ...stored, settlingBy: "ses_grand", settlingAt: Date.now() })
     expect(
       await answerQuestion(test.ctx, test.deps, {
         actor: "ses_parent",
@@ -169,5 +170,109 @@ describe("postal_answer", () => {
         answer: { q0: "x" },
       }),
     ).toMatchObject({ ok: false, error: expect.stringContaining("being answered by ses_grand") })
+
+    test.storage.set(questionKey("form_1"), {
+      ...stored,
+      settlingBy: "ses_parent",
+      settlingAt: Date.now(),
+    })
+    expect(
+      await answerQuestion(test.ctx, test.deps, {
+        actor: "ses_parent",
+        formID: "form_1",
+        answer: { q0: "x" },
+      }),
+    ).toMatchObject({ ok: false, error: expect.stringContaining("being answered by ses_parent") })
   })
+
+  it("recovers a stale settling marker", async () => {
+    const test = harness()
+    const stored = test.storage.get(questionKey("form_1")) as Record<string, unknown>
+    test.storage.set(questionKey("form_1"), {
+      ...stored,
+      settlingBy: "ses_grand",
+      settlingAt: Date.now() - 60_000,
+    })
+    const result = await answerQuestion(test.ctx, test.deps, {
+      actor: "ses_parent",
+      formID: "form_1",
+      answer: { q0: "x" },
+    })
+    expect(result.ok).toBe(true)
+    expect(test.replies).toHaveLength(1)
+  })
+  it("only cancels on a confirmed form-not-found and never credits a rejected answer", async () => {
+    const test = harness()
+    test.ctx.session = undefined
+    let message = "Not Found"
+    let status = 404
+    const server = Bun.serve({
+      port: 0,
+      fetch: async () =>
+        new Response(JSON.stringify({ message }), {
+          status,
+          headers: { "content-type": "application/json" },
+        }),
+    })
+    test.deps.env = {
+      OPENCODE_SERVER_URL: `http://127.0.0.1:${server.port}`,
+      OPENCODE_SERVER_PASSWORD: "pw",
+    }
+    try {
+      expect(
+        await answerQuestion(test.ctx, test.deps, {
+          actor: "ses_parent",
+          formID: "form_1",
+          answer: { q0: "x" },
+        }),
+      ).toMatchObject({ ok: false, status: 404 })
+      let record = await readQuestion(test.ctx, "form_1")
+      expect(record?.status).toBe("pending")
+      expect(record?.note).toBe("form_state_unknown")
+
+      message = "Form not found: form_1"
+      expect(
+        await answerQuestion(test.ctx, test.deps, {
+          actor: "ses_parent",
+          formID: "form_1",
+          answer: { q0: "x" },
+        }),
+      ).toMatchObject({ ok: false, status: 404 })
+      record = await readQuestion(test.ctx, "form_1")
+      expect(record?.status).toBe("cancelled")
+      expect(record?.note).toBe("form_not_found")
+
+      const second = harness()
+      second.ctx.session = undefined
+      const conflict = Bun.serve({
+        port: 0,
+        fetch: async () =>
+          new Response(JSON.stringify({ message: "Form already settled: form_1" }), {
+            status: 409,
+            headers: { "content-type": "application/json" },
+          }),
+      })
+      second.deps.env = {
+        OPENCODE_SERVER_URL: `http://127.0.0.1:${conflict.port}`,
+        OPENCODE_SERVER_PASSWORD: "pw",
+      }
+      try {
+        expect(
+          await answerQuestion(second.ctx, second.deps, {
+            actor: "ses_parent",
+            formID: "form_1",
+            answer: { q0: "x" },
+          }),
+        ).toMatchObject({ ok: false, status: 409 })
+        const settled = await readQuestion(second.ctx, "form_1")
+        expect(settled).toMatchObject({ status: "answered", note: "form_already_settled" })
+        expect(settled?.answeredBy).toBeUndefined()
+      } finally {
+        conflict.stop(true)
+      }
+    } finally {
+      server.stop(true)
+    }
+  })
+
 })
