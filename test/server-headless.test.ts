@@ -16,6 +16,9 @@ type Prompt = {
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 5))
 
+const outboxKey = (from: string, id: string) =>
+  `outbox/${encodeURIComponent(from)}/${encodeURIComponent(id)}`
+
 function harness() {
   const storage = new Map<string, unknown>()
   const prompts: Prompt[] = []
@@ -918,7 +921,7 @@ describe("watchdog and outbox cleanup", () => {
     expect(nudge.metadata?.postal?.kind).toBe("system")
     expect(nudge.metadata?.postal?.replyTo).toBe("msg_task")
     expect(nudge.text).toContain("Watchdog")
-    const record = test.storage.get("outbox/msg_task") as any
+    const record = test.storage.get(outboxKey("ses_a", "msg_task")) as any
     expect(record.nudges).toBe(1)
   })
 
@@ -945,19 +948,19 @@ describe("watchdog and outbox cleanup", () => {
     test.addSession("ses_b", "B")
     await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
     await test.tools.send.execute({ to: "ses_b", text: "old letter", msg_id: "msg_old_outbox" }, { sessionID: "ses_a" })
-    const record = test.storage.get("outbox/msg_old_outbox") as any
+    const record = test.storage.get(outboxKey("ses_a", "msg_old_outbox")) as any
     record.createdAt = Date.now() - 8 * 24 * 60 * 60 * 1000
-    test.storage.set("outbox/msg_old_outbox", record)
+    test.storage.set(outboxKey("ses_a", "msg_old_outbox"), record)
 
     const dry = await test.tools.cleanup.execute({ dryRun: true }, { sessionID: "ses_a" })
     expect(dry.content).toContain("CLEANUP_DRY_RUN")
     expect(dry.content).toContain("COUNT\t1")
-    expect(test.storage.has("outbox/msg_old_outbox")).toBe(true)
+    expect(test.storage.has(outboxKey("ses_a", "msg_old_outbox"))).toBe(true)
 
     const removed = await test.tools.cleanup.execute({ dryRun: false }, { sessionID: "ses_a" })
     expect(removed.content).toContain("CLEANUP_REMOVED")
     expect(removed.content).toContain("COUNT\t1")
-    expect(test.storage.has("outbox/msg_old_outbox")).toBe(false)
+    expect(test.storage.has(outboxKey("ses_a", "msg_old_outbox"))).toBe(false)
     expect((await test.tools.inbox.execute({}, { sessionID: "ses_a" })).content).not.toContain("msg_old_outbox")
   })
 })
@@ -1080,7 +1083,7 @@ describe("ACK semantics", () => {
       metadata: structuredClone(sent.metadata),
     })
     await flush()
-    expect((test.storage.get("outbox/msg_admit_only") as any).status).toBe("delivered")
+    expect((test.storage.get(outboxKey("ses_a", "msg_admit_only")) as any).status).toBe("delivered")
   })
 
   it("keeps an admitted task visible to the watchdog", async () => {
@@ -1126,16 +1129,16 @@ describe("ACK semantics", () => {
       metadata: structuredClone(nudge.metadata),
     })
     await flush()
-    expect((test.storage.get("outbox/msg_nudge_task") as any).status).toBe("delivered")
+    expect((test.storage.get(outboxKey("ses_a", "msg_nudge_task")) as any).status).toBe("delivered")
 
     // Simulate the nudge interval elapsing; the task must still be monitored.
-    const record = test.storage.get("outbox/msg_nudge_task") as any
+    const record = test.storage.get(outboxKey("ses_a", "msg_nudge_task")) as any
     record.lastNudgeAt = 0
-    test.storage.set("outbox/msg_nudge_task", record)
+    test.storage.set(outboxKey("ses_a", "msg_nudge_task"), record)
     const second = await test.tools.watchdog.execute({ afterSeconds: 0 }, { sessionID: "ses_a" })
     expect(second.content).toContain("msg_nudge_task")
     expect(second.content).toContain("NUDGED\tmsg_nudge_task")
-    expect((test.storage.get("outbox/msg_nudge_task") as any).nudges).toBe(2)
+    expect((test.storage.get(outboxKey("ses_a", "msg_nudge_task")) as any).nudges).toBe(2)
   })
 
   it("ignores an ack for a record addressed to another peer", async () => {
@@ -1160,7 +1163,7 @@ describe("ACK semantics", () => {
       metadata: structuredClone(forged.metadata),
     })
     await flush()
-    expect((test.storage.get("outbox/msg_cross_task") as any).status).toBe("delivered")
+    expect((test.storage.get(outboxKey("ses_a", "msg_cross_task")) as any).status).toBe("delivered")
   })
 })
 
@@ -1212,5 +1215,92 @@ describe("session lifecycle integrity", () => {
     const second = await test.tools.status.execute({}, { sessionID: "ses_a" })
     expect(second.content).toContain("ses_b")
     test.context.session.get = original
+  })
+})
+
+describe("concurrency and sender scoping", () => {
+  it("serializes concurrent claims for one scope", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    const [a, b] = await Promise.all([
+      test.tools.claim.execute({ scope: "shared", ttl: 60 }, { sessionID: "ses_a" }),
+      test.tools.claim.execute({ scope: "shared", ttl: 60 }, { sessionID: "ses_b" }),
+    ])
+    const results = [a.content, b.content]
+    expect(results.filter((result) => result.includes("claimed")).length).toBe(1)
+    expect(results.filter((result) => result.includes("claim busy")).length).toBe(1)
+  })
+
+  it("scopes watchdog nudges to the caller's outbox", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    test.addSession("ses_c", "C")
+    await test.rpc.presence({ sessions: [{ id: "ses_b", title: "B", state: "idle", pending: [] }] })
+    await test.tools.send.execute(
+      { to: "ses_b", text: "task", kind: "task", task_id: "T1", msg_id: "msg_c_owned" },
+      { sessionID: "ses_c" },
+    )
+    const watchdog = await test.tools.watchdog.execute({ afterSeconds: 0 }, { sessionID: "ses_a" })
+    expect(watchdog.content).not.toContain("msg_c_owned")
+  })
+
+  it("scopes cleanup to the caller's outbox", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    test.addSession("ses_c", "C")
+    await test.tools.send.execute(
+      { to: "ses_b", text: "old", msg_id: "msg_c_old" },
+      { sessionID: "ses_c" },
+    )
+    const key = outboxKey("ses_c", "msg_c_old")
+    const record = test.storage.get(key) as any
+    record.createdAt = Date.now() - 8 * 24 * 60 * 60 * 1000
+    test.storage.set(key, record)
+    const result = await test.tools.cleanup.execute({ dryRun: false }, { sessionID: "ses_a" })
+    expect(result.content).toContain("COUNT\t0")
+    expect(test.storage.has(key)).toBe(true)
+  })
+
+  it("rejects cross-session inspection without lifecycle authority", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_c", "C")
+    const inbox = await test.tools.inbox.execute({ sessionID: "ses_c" }, { sessionID: "ses_a" })
+    const status = await test.tools.status.execute({ sessionID: "ses_c" }, { sessionID: "ses_a" })
+    const log = await test.tools.log.execute({ sessionID: "ses_c" }, { sessionID: "ses_a" })
+    expect(inbox.content).toContain("not authorized")
+    expect(status.content).toContain("not authorized")
+    expect(log.content).toContain("not authorized")
+  })
+
+  it("allows a parent to inspect its child", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+    const inbox = await test.tools.inbox.execute({ sessionID: b.id }, { sessionID: "ses_a" })
+    expect(inbox.content).not.toContain("not authorized")
+  })
+
+  it("keeps idempotency keys per sender", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    test.addSession("ses_c", "C")
+    const first = await test.tools.send.execute(
+      { to: "ses_b", text: "from a", msg_id: "msg_shared" },
+      { sessionID: "ses_a" },
+    )
+    const second = await test.tools.send.execute(
+      { to: "ses_b", text: "from c", msg_id: "msg_shared" },
+      { sessionID: "ses_c" },
+    )
+    expect(first.content).toContain("delivered")
+    expect(second.content).toContain("delivered")
+    expect(test.storage.has(outboxKey("ses_a", "msg_shared"))).toBe(true)
+    expect(test.storage.has(outboxKey("ses_c", "msg_shared"))).toBe(true)
   })
 })

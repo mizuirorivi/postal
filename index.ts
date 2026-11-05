@@ -361,6 +361,11 @@ async function removeParent(ctx: PostalContext, childID: string): Promise<void> 
   else await ctx.storage.set(`children/${previous.parentID}`, next)
 }
 
+/** A session may inspect itself, or a session it can command as parent/ancestor. */
+async function canInspect(ctx: PostalContext, actor: string, target: string): Promise<boolean> {
+  return target === actor || (await isAuthorizedParent(ctx, actor, target))
+}
+
 /** Check whether actor is the direct parent of target, or an ancestor when enabled. */
 async function isAuthorizedParent(
   ctx: PostalContext,
@@ -746,7 +751,7 @@ async function postOnly(
     },
   })
   const now = Date.now()
-  await ctx.storage.set(`msg/${envelope.msgID}`, now).catch(() => {})
+  await ctx.storage.set(messageKey(options.from, envelope.msgID), now).catch(() => {})
   await ctx.storage.set(`last/${rallyKey(options.from, options.to)}`, now).catch(() => {})
   return envelope
 }
@@ -811,6 +816,8 @@ async function rallyRemaining(
 
 const OUTBOX_INDEX = "outbox/index"
 const outboxLocks = new Map<string, Promise<unknown>>()
+const claimLocks = new Map<string, Promise<unknown>>()
+const peerLocks = new Map<string, Promise<unknown>>()
 let outboxTimer: ReturnType<typeof setInterval> | undefined
 let lastOutboxCleanupAt = 0
 const MAX_OUTBOX_ATTEMPTS = 6
@@ -820,43 +827,98 @@ function retryDelay(attempts: number): number {
   return Math.min(5 * 60_000, 1000 * 2 ** Math.max(0, attempts - 1))
 }
 
+/** Sender-scoped keys so one session's msg_id cannot block another session's mail. */
+function outboxKey(from: string, msgID: string): string {
+  return `outbox/${encodeURIComponent(from)}/${encodeURIComponent(msgID)}`
+}
+
+function messageKey(from: string, msgID: string): string {
+  return `msg/${encodeURIComponent(from)}/${encodeURIComponent(msgID)}`
+}
+
+function pairLockKey(a: string, b: string): string {
+  return [a, b].sort().join(":")
+}
+
 async function readOutboxIndex(ctx: PostalContext): Promise<string[]> {
   const value = await ctx.storage.get(OUTBOX_INDEX)
-  return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : []
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((id): id is string => typeof id === "string")
+    .map((id) => (id.startsWith("outbox/") ? id : `outbox/${id}`))
 }
 
-async function writeOutboxIndex(ctx: PostalContext, ids: string[]): Promise<void> {
-  if (ids.length === 0) await ctx.storage.remove(OUTBOX_INDEX)
-  else await ctx.storage.set(OUTBOX_INDEX, ids)
+async function writeOutboxIndex(ctx: PostalContext, keys: string[]): Promise<void> {
+  if (keys.length === 0) await ctx.storage.remove(OUTBOX_INDEX)
+  else await ctx.storage.set(OUTBOX_INDEX, keys)
 }
 
-async function addOutboxIndex(ctx: PostalContext, msgID: string): Promise<void> {
+async function addOutboxIndex(ctx: PostalContext, key: string): Promise<void> {
   await serialized(outboxLocks, "index", async () => {
     const index = await readOutboxIndex(ctx)
-    if (!index.includes(msgID)) {
-      index.push(msgID)
+    if (!index.includes(key)) {
+      index.push(key)
       await writeOutboxIndex(ctx, index)
     }
   })
 }
 
-async function getOutbox(ctx: PostalContext, msgID: string): Promise<OutboxRecord | undefined> {
-  const value = await ctx.storage.get(`outbox/${msgID}`)
-  return value && typeof value === "object" ? (value as OutboxRecord) : undefined
+async function removeOutboxIndex(ctx: PostalContext, key: string): Promise<void> {
+  await serialized(outboxLocks, "index", async () => {
+    const index = await readOutboxIndex(ctx)
+    const next = index.filter((entry) => entry !== key)
+    if (next.length !== index.length) await writeOutboxIndex(ctx, next)
+  })
+}
+
+async function getOutbox(
+  ctx: PostalContext,
+  msgID: string,
+  from: string,
+): Promise<OutboxRecord | undefined> {
+  const value = await ctx.storage.get(outboxKey(from, msgID))
+  if (value && typeof value === "object") return value as OutboxRecord
+  const legacy = await ctx.storage.get(`outbox/${msgID}`)
+  if (legacy && typeof legacy === "object" && (legacy as OutboxRecord).from === from) {
+    return legacy as OutboxRecord
+  }
+  return undefined
 }
 
 async function putOutbox(ctx: PostalContext, record: OutboxRecord): Promise<void> {
-  await ctx.storage.set(`outbox/${record.msgID}`, record)
-  await addOutboxIndex(ctx, record.msgID)
+  const key = outboxKey(record.from, record.msgID)
+  await ctx.storage.set(key, record)
+  try {
+    await addOutboxIndex(ctx, key)
+  } catch (error) {
+    // Never leave a record that the index cannot reach.
+    await ctx.storage.remove(key).catch(() => {})
+    throw error
+  }
 }
 
 async function updateOutbox(ctx: PostalContext, record: OutboxRecord): Promise<void> {
-  await ctx.storage.set(`outbox/${record.msgID}`, record)
+  const key = outboxKey(record.from, record.msgID)
+  await ctx.storage.set(key, record)
+  await addOutboxIndex(ctx, key)
+  const legacyKey = `outbox/${record.msgID}`
+  if (legacyKey !== key) {
+    const legacy = await ctx.storage.get(legacyKey)
+    if (legacy && typeof legacy === "object" && (legacy as OutboxRecord).from === record.from) {
+      await ctx.storage.remove(legacyKey)
+      await removeOutboxIndex(ctx, legacyKey)
+    }
+  }
 }
 
 async function listOutbox(ctx: PostalContext, from?: string): Promise<OutboxRecord[]> {
-  const index = await readOutboxIndex(ctx)
-  const records = await Promise.all(index.map((msgID) => getOutbox(ctx, msgID)))
+  const keys = await readOutboxIndex(ctx)
+  const records = await Promise.all(
+    keys.map(async (key) => {
+      const value = await ctx.storage.get(key)
+      return value && typeof value === "object" ? (value as OutboxRecord) : undefined
+    }),
+  )
   return records.filter((record): record is OutboxRecord => Boolean(record) && (!from || record!.from === from))
 }
 
@@ -865,20 +927,22 @@ async function markOutboxAcked(
   msgID: string,
   expected: { sessionID: string; peerID: string },
 ): Promise<void> {
-  const record = await getOutbox(ctx, msgID)
-  if (!record) return
-  if (record.from !== expected.sessionID || record.to !== expected.peerID) return
-  if (record.status === "delivered" || record.status === "pending") {
-    record.status = "acked"
-    record.ackedAt = Date.now()
-    await updateOutbox(ctx, record)
-  }
+  await serialized(outboxLocks, `record/${expected.sessionID}/${msgID}`, async () => {
+    const record = await getOutbox(ctx, msgID, expected.sessionID)
+    if (!record) return
+    if (record.from !== expected.sessionID || record.to !== expected.peerID) return
+    if (record.status === "delivered" || record.status === "pending") {
+      record.status = "acked"
+      record.ackedAt = Date.now()
+      await updateOutbox(ctx, record)
+    }
+  })
 }
 
 /** Retry one outbox record and persist its new state. */
 async function attemptOutbox(ctx: PostalContext, input: OutboxRecord): Promise<OutboxRecord> {
-  return serialized(outboxLocks, `record/${input.msgID}`, async () => {
-    const record = (await getOutbox(ctx, input.msgID)) ?? input
+  return serialized(outboxLocks, `record/${input.from}/${input.msgID}`, async () => {
+    const record = (await getOutbox(ctx, input.msgID, input.from)) ?? input
     if (record.status === "delivered" || record.status === "acked") return record
     if (record.queuedForWindow) {
       // The rally window has passed; count this delivery as the first letter
@@ -932,8 +996,8 @@ async function dispatchLetter(
   nextAt?: number
   attempts?: number
 }> {
-  const existingMessage = await ctx.storage.get(`msg/${options.envelope.msgID}`)
-  const existingOutbox = await getOutbox(ctx, options.envelope.msgID)
+  const existingMessage = await ctx.storage.get(messageKey(options.from, options.envelope.msgID))
+  const existingOutbox = await getOutbox(ctx, options.envelope.msgID, options.from)
   if (existingMessage || existingOutbox) {
     return { ok: true, msgID: options.envelope.msgID, status: "duplicate" }
   }
@@ -1015,7 +1079,7 @@ async function retryOutbox(ctx: PostalContext): Promise<void> {
 /** Nudge idle workers that still have an unacked task letter. */
 async function runWatchdog(
   ctx: PostalContext,
-  options: { dryRun?: boolean; afterSeconds?: number; nudgeUnknown?: boolean } = {},
+  options: { dryRun?: boolean; afterSeconds?: number; nudgeUnknown?: boolean; from?: string } = {},
 ): Promise<{ candidates: OutboxRecord[]; nudged: string[] }> {
   const afterMs =
     typeof options.afterSeconds === "number" && options.afterSeconds >= 0
@@ -1025,7 +1089,7 @@ async function runWatchdog(
   const maxNudges = watchdogMaxNudges(ctx)
   const nudgeUnknown = options.nudgeUnknown === true || ctx.options?.watchdogNudgeUnknown === true
   const now = Date.now()
-  const records = await listOutbox(ctx)
+  const records = await listOutbox(ctx, options.from)
   const candidates = records.filter(
     (record) =>
       record.status === "delivered" &&
@@ -1069,22 +1133,34 @@ async function runWatchdog(
 }
 
 /** Remove old delivered/acked/failed outbox records; msg markers stay for idempotency. */
-async function cleanupOutbox(ctx: PostalContext, options: { dryRun?: boolean } = {}): Promise<OutboxRecord[]> {
+async function cleanupOutbox(
+  ctx: PostalContext,
+  options: { dryRun?: boolean; from?: string } = {},
+): Promise<OutboxRecord[]> {
   const ttl = outboxTtlMs(ctx)
   const now = Date.now()
-  const records = await listOutbox(ctx)
+  const records = await listOutbox(ctx, options.from)
   const expired = records.filter(
     (record) =>
       (record.status === "delivered" || record.status === "acked" || record.status === "failed") &&
       now - record.createdAt > ttl,
   )
   if (options.dryRun || expired.length === 0) return expired
-  const ids = new Set(expired.map((record) => record.msgID))
-  for (const msgID of ids) await ctx.storage.remove(`outbox/${msgID}`)
+  const keys = new Set<string>()
+  for (const record of expired) {
+    const key = outboxKey(record.from, record.msgID)
+    keys.add(key)
+    await ctx.storage.remove(key)
+    const legacyKey = `outbox/${record.msgID}`
+    keys.add(legacyKey)
+    const legacy = await ctx.storage.get(legacyKey)
+    if (legacy && typeof legacy === "object" && (legacy as OutboxRecord).from === record.from) {
+      await ctx.storage.remove(legacyKey)
+    }
+  }
   await serialized(outboxLocks, "index", async () => {
     const index = await readOutboxIndex(ctx)
-    const next = index.filter((msgID) => !ids.has(msgID))
-    await writeOutboxIndex(ctx, next)
+    await writeOutboxIndex(ctx, index.filter((key) => !keys.has(key)))
   })
   return expired
 }
@@ -1180,20 +1256,22 @@ async function refreshNote(ctx: PostalContext, sessionID: string): Promise<void>
 /** Pair two sessions; both sides keep every peer they have connected. */
 async function pair(ctx: PostalContext, from: string, peerID: string): Promise<PairResult> {
   if (!peerID || peerID === from) return { ok: false, error: "invalid peer" }
-  try {
-    const [self, peer] = await Promise.all([
-      ctx.session.get({ sessionID: from }),
-      ctx.session.get({ sessionID: peerID }),
-    ])
-    await addPeer(ctx, from, { id: peerID, title: peer.title ?? "" })
-    await addPeer(ctx, peerID, { id: from, title: self.title ?? "" })
-    await ensureHmacRecord(ctx, from, peerID)
-    await Promise.all([refreshNote(ctx, from), refreshNote(ctx, peerID)])
-    return { ok: true, peerID, title: peer.title ?? "" }
-  } catch (error) {
-    console.warn(`postal: pairing ${from} <-> ${peerID} failed: ${errorText(error)}`)
-    return { ok: false, error: errorText(error) }
-  }
+  return serialized(peerLocks, pairLockKey(from, peerID), async () => {
+    try {
+      const [self, peer] = await Promise.all([
+        ctx.session.get({ sessionID: from }),
+        ctx.session.get({ sessionID: peerID }),
+      ])
+      await addPeer(ctx, from, { id: peerID, title: peer.title ?? "" })
+      await addPeer(ctx, peerID, { id: from, title: self.title ?? "" })
+      await ensureHmacRecord(ctx, from, peerID)
+      await Promise.all([refreshNote(ctx, from), refreshNote(ctx, peerID)])
+      return { ok: true, peerID, title: peer.title ?? "" }
+    } catch (error) {
+      console.warn(`postal: pairing ${from} <-> ${peerID} failed: ${errorText(error)}`)
+      return { ok: false, error: errorText(error) }
+    }
+  })
 }
 
 /** Read all peers for a session, dropping records whose session is gone. */
@@ -1384,6 +1462,9 @@ async function setup(ctx: PostalContext): Promise<void> {
           (input as { sessionID: string }).sessionID.length > 0
             ? (input as { sessionID: string }).sessionID
             : context.sessionID
+        if (!(await canInspect(ctx, context.sessionID, target))) {
+          return { content: "postal: not authorized to inspect another session" }
+        }
         const status = await peerStatus(ctx, target)
         if (status.ok === false) return { content: `postal: status failed: ${status.error ?? "unknown error"}` }
         const peers = status.peers ?? []
@@ -1433,6 +1514,9 @@ async function setup(ctx: PostalContext): Promise<void> {
       execute: async (input, context) => {
         const value = input as { sessionID?: string; limit?: number }
         const target = value.sessionID?.trim() || context.sessionID
+        if (!(await canInspect(ctx, context.sessionID, target))) {
+          return { content: "postal: not authorized to inspect another session" }
+        }
         const limit = Number.isFinite(value.limit)
           ? Math.max(1, Math.min(100, Math.floor(value.limit as number)))
           : 20
@@ -1809,6 +1893,9 @@ async function setup(ctx: PostalContext): Promise<void> {
       execute: async (input, context) => {
         const value = input as { sessionID?: string; limit?: number }
         const target = value.sessionID?.trim() || context.sessionID
+        if (!(await canInspect(ctx, context.sessionID, target))) {
+          return { content: "postal: not authorized to inspect another session" }
+        }
         const limit = Number.isFinite(value.limit)
           ? Math.max(1, Math.min(200, Math.floor(value.limit as number)))
           : 50
@@ -1868,7 +1955,7 @@ async function setup(ctx: PostalContext): Promise<void> {
       execute: async (input, context) => {
         const msgID = String((input as { msg_id?: unknown }).msg_id ?? "")
         if (!msgID) return { content: "postal: 'msg_id' is required" }
-        const record = await getOutbox(ctx, msgID)
+        const record = await getOutbox(ctx, msgID, context.sessionID)
         if (!record) return { content: `postal: outbox entry not found: ${msgID}` }
         if (record.from !== context.sessionID) {
           return { content: "postal: cannot resend another session's letter" }
@@ -1909,21 +1996,23 @@ async function setup(ctx: PostalContext): Promise<void> {
         const rawTtl = Number((input as { ttl?: unknown }).ttl)
         const ttl = Number.isFinite(rawTtl) ? Math.max(5, Math.min(3600, Math.floor(rawTtl))) : 60
         const key = `claim/${scope}`
-        const existing = (await ctx.storage.get(key)) as ClaimRecord | undefined
-        const now = Date.now()
-        if (existing && existing.expiresAt > now && existing.owner !== context.sessionID) {
-          return {
-            content:
-              `postal: claim busy: ${scope} is owned by ${existing.owner} ` +
-              `until ${new Date(existing.expiresAt).toISOString()}`,
+        return serialized(claimLocks, scope, async () => {
+          const existing = (await ctx.storage.get(key)) as ClaimRecord | undefined
+          const now = Date.now()
+          if (existing && existing.expiresAt > now && existing.owner !== context.sessionID) {
+            return {
+              content:
+                `postal: claim busy: ${scope} is owned by ${existing.owner} ` +
+                `until ${new Date(existing.expiresAt).toISOString()}`,
+            }
           }
-        }
-        await ctx.storage.set(key, {
-          scope,
-          owner: context.sessionID,
-          expiresAt: now + ttl * 1000,
-        } satisfies ClaimRecord)
-        return { content: `postal: claimed ${scope} for ${ttl}s` }
+          await ctx.storage.set(key, {
+            scope,
+            owner: context.sessionID,
+            expiresAt: now + ttl * 1000,
+          } satisfies ClaimRecord)
+          return { content: `postal: claimed ${scope} for ${ttl}s` }
+        })
       },
     })
 
@@ -1942,13 +2031,15 @@ async function setup(ctx: PostalContext): Promise<void> {
         const scope = String((input as { scope?: unknown }).scope ?? "").trim()
         if (!scope) return { content: "postal: 'scope' is required" }
         const key = `claim/${scope}`
-        const existing = (await ctx.storage.get(key)) as ClaimRecord | undefined
-        if (!existing) return { content: `postal: claim not held: ${scope}` }
-        if (existing.owner !== context.sessionID) {
-          return { content: `postal: claim owned by ${existing.owner}: ${scope}` }
-        }
-        await ctx.storage.remove(key)
-        return { content: `postal: released ${scope}` }
+        return serialized(claimLocks, scope, async () => {
+          const existing = (await ctx.storage.get(key)) as ClaimRecord | undefined
+          if (!existing) return { content: `postal: claim not held: ${scope}` }
+          if (existing.owner !== context.sessionID) {
+            return { content: `postal: claim owned by ${existing.owner}: ${scope}` }
+          }
+          await ctx.storage.remove(key)
+          return { content: `postal: released ${scope}` }
+        })
       },
     })
 
@@ -2020,7 +2111,7 @@ async function setup(ctx: PostalContext): Promise<void> {
       },
       execute: async (input, context) => {
         const value = input as { dryRun?: boolean; afterSeconds?: number; nudgeUnknown?: boolean }
-        const result = await runWatchdog(ctx, value)
+        const result = await runWatchdog(ctx, { ...value, from: context.sessionID })
         const rows = result.candidates.map((record) => {
           const age = Math.max(0, Math.floor((Date.now() - record.createdAt) / 1000))
           return [
@@ -2056,7 +2147,7 @@ async function setup(ctx: PostalContext): Promise<void> {
       },
       execute: async (input, context) => {
         const dryRun = (input as { dryRun?: boolean }).dryRun !== false
-        const expired = await cleanupOutbox(ctx, { dryRun })
+        const expired = await cleanupOutbox(ctx, { dryRun, from: context.sessionID })
         return {
           content: [
             dryRun ? "CLEANUP_DRY_RUN" : "CLEANUP_REMOVED",
