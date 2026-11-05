@@ -27,6 +27,7 @@
 import { PostalRpc } from "./rpc.js"
 import { serialized } from "./lock.js"
 import { defaultLockStorePath, openLockStore } from "./state.js"
+import { ensureGrant, writeSpawnFact, type Lock } from "./grants.js"
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto"
 import { readFileSync, realpathSync, statSync } from "node:fs"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
@@ -891,6 +892,10 @@ async function crossProcessLock<T>(
   return store.withLock(key, task)
 }
 
+function stateLock(ctx: PostalContext): Lock {
+  return (key, task) => crossProcessLock(ctx, key, task)
+}
+
 async function readOutboxIndex(ctx: PostalContext): Promise<string[]> {
   const value = await ctx.storage.get(OUTBOX_INDEX)
   if (!Array.isArray(value)) return []
@@ -1496,6 +1501,8 @@ async function pair(ctx: PostalContext, from: string, peerID: string): Promise<P
         await addPeer(ctx, from, { id: peerID, title: peer.title ?? "" })
         await addPeer(ctx, peerID, { id: from, title: self.title ?? "" })
         await ensureHmacRecord(ctx, from, peerID)
+        await ensureGrant(ctx, stateLock(ctx), from, peerID)
+        await ensureGrant(ctx, stateLock(ctx), peerID, from)
         await Promise.all([refreshNote(ctx, from), refreshNote(ctx, peerID)])
         return { ok: true, peerID, title: peer.title ?? "" }
       } catch (error) {
@@ -1846,7 +1853,16 @@ async function setup(ctx: PostalContext): Promise<void> {
             }),
           )
           if (!created) throw new Error("session create returned no id")
+          await writeSpawnFact(
+            ctx,
+            stateLock(ctx),
+            created.id,
+            context.sessionID,
+            directory || ctx.location.directory,
+          )
           await writeParent(ctx, created.id, context.sessionID)
+          await ensureGrant(ctx, stateLock(ctx), context.sessionID, created.id)
+          await ensureGrant(ctx, stateLock(ctx), created.id, context.sessionID)
           let paired = false
           let pairError = ""
           if (autoPair) {

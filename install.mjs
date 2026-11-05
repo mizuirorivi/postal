@@ -58,6 +58,7 @@ const files = [
   "rpc.ts",
   "lock.ts",
   "state.ts",
+  "grants.ts",
   "fuzzy.ts",
   "sessions.ts",
   "status.ts",
