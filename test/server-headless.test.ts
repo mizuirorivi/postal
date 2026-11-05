@@ -2017,6 +2017,12 @@ describe("v2 approvals", () => {
     const self = await test.tools.approve.execute({ approval_id: id }, { sessionID: a.id })
     expect(self.content).toContain("not authorized")
 
+    const pending = await test.tools.approvals.execute(
+      { status: "pending" },
+      { sessionID: "ses_root" },
+    )
+    expect(pending.content).toContain(id)
+
     const approved = await test.tools.approve.execute({ approval_id: id }, { sessionID: "ses_root" })
     expect(approved.content).toContain("APPROVED")
 
@@ -2043,6 +2049,28 @@ describe("v2 approvals", () => {
     expect(audit.content).toContain("approval_consume")
     const approverAudit = await test.tools.audit.execute({}, { sessionID: "ses_root" })
     expect(approverAudit.content).toContain("approval_approve")
+  })
+
+  it("lets a root session approve its own request when it has no parent", async () => {
+    const test = await boot()
+    test.addSession("ses_root", "Root")
+    await test.tools.spawn.execute({ title: "A" }, { sessionID: "ses_root" })
+    const a = [...test.sessions.values()].find((session) => session.title === "A")!
+
+    const requested = await test.tools.request_approval.execute(
+      { operation: "close", resource: a.id },
+      { sessionID: "ses_root" },
+    )
+    const id = approvalID(requested.content)
+    const approved = await test.tools.approve.execute({ approval_id: id }, { sessionID: "ses_root" })
+    expect(approved.content).toContain("APPROVED")
+    expect(approved.content).toContain("APPROVER\tses_root")
+
+    const closed = await test.tools.close.execute(
+      { sessionID: a.id, approval_id: id },
+      { sessionID: "ses_root" },
+    )
+    expect(closed.content).toContain(`closed ${a.id}`)
   })
 
   it("rejects expired approvals without executing the operation", async () => {

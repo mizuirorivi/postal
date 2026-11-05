@@ -1816,7 +1816,11 @@ async function recordAudit(
 
 /** The proposer's parent/owner or an explicit approve grant holder may decide. */
 async function canApprove(ctx: PostalContext, actor: string, proposer: string): Promise<boolean> {
-  if (!actor || actor === proposer) return false
+  if (!actor) return false
+  // A root session has no higher authority. Let it approve its own request so
+  // manual root sessions are not permanently unable to use approval-gated
+  // close/interrupt; spawned sessions still need a parent or approve holder.
+  if (actor === proposer) return (await readCurrentParent(ctx, proposer)) === undefined
   if ((await readCurrentParent(ctx, proposer)) === actor) return true
   const spawn = await readSpawnFact(ctx, proposer)
   if (spawn?.spawnedBy === actor) return true
@@ -2570,7 +2574,11 @@ async function setup(ctx: PostalContext): Promise<void | (() => void)> {
           return { content: "postal: not authorized to approve this request" }
         }
         try {
+          const selfRoot =
+            context.sessionID === record.proposer &&
+            (await readCurrentParent(ctx, record.proposer)) === undefined
           const approved = await approveApproval(ctx, stateLock(ctx), approvalID, context.sessionID, {
+            ...(selfRoot ? { allowSelfApproval: true } : {}),
             ...(value.executor?.trim() ? { executor: value.executor.trim() } : {}),
           })
           await recordAudit(ctx, context.sessionID, "approval_approve", approved.approvalID, {
@@ -2670,7 +2678,8 @@ async function setup(ctx: PostalContext): Promise<void | (() => void)> {
 
     editor.add({
       name: "approvals",
-      description: "List approval requests proposed or decided by the caller.",
+      description:
+        "List approval requests proposed or decided by the caller, plus pending requests the caller may approve.",
       input: {
         type: "object",
         properties: {
@@ -2683,9 +2692,16 @@ async function setup(ctx: PostalContext): Promise<void | (() => void)> {
       },
       execute: async (input, context) => {
         const status = (input as { status?: string }).status
-        const approvals = (await listApprovals(ctx)).filter(
-          (record) => record.proposer === context.sessionID || record.approver === context.sessionID,
-        )
+        const approvals = []
+        for (const record of await listApprovals(ctx)) {
+          if (record.proposer === context.sessionID || record.approver === context.sessionID) {
+            approvals.push(record)
+            continue
+          }
+          if (record.status === "pending" && (await canApprove(ctx, context.sessionID, record.proposer))) {
+            approvals.push(record)
+          }
+        }
         const filtered = status
           ? approvals.filter((record) => record.status === status)
           : approvals
