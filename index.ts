@@ -892,21 +892,25 @@ async function writeOutboxIndex(ctx: PostalContext, keys: string[]): Promise<voi
 }
 
 async function addOutboxIndex(ctx: PostalContext, key: string): Promise<void> {
-  await serialized(outboxLocks, "index", async () => {
-    const index = await readOutboxIndex(ctx)
-    if (!index.includes(key)) {
-      index.push(key)
-      await writeOutboxIndex(ctx, index)
-    }
-  })
+  await serialized(outboxLocks, "index", () =>
+    crossProcessLock(ctx, "outbox/index", async () => {
+      const index = await readOutboxIndex(ctx)
+      if (!index.includes(key)) {
+        index.push(key)
+        await writeOutboxIndex(ctx, index)
+      }
+    }),
+  )
 }
 
 async function removeOutboxIndex(ctx: PostalContext, key: string): Promise<void> {
-  await serialized(outboxLocks, "index", async () => {
-    const index = await readOutboxIndex(ctx)
-    const next = index.filter((entry) => entry !== key)
-    if (next.length !== index.length) await writeOutboxIndex(ctx, next)
-  })
+  await serialized(outboxLocks, "index", () =>
+    crossProcessLock(ctx, "outbox/index", async () => {
+      const index = await readOutboxIndex(ctx)
+      const next = index.filter((entry) => entry !== key)
+      if (next.length !== index.length) await writeOutboxIndex(ctx, next)
+    }),
+  )
 }
 
 async function getOutbox(
@@ -925,14 +929,16 @@ async function getOutbox(
 
 async function putOutbox(ctx: PostalContext, record: OutboxRecord): Promise<void> {
   const key = outboxKey(record.from, record.msgID)
-  await ctx.storage.set(key, record)
-  try {
-    await addOutboxIndex(ctx, key)
-  } catch (error) {
-    // Never leave a record that the index cannot reach.
-    await ctx.storage.remove(key).catch(() => {})
-    throw error
-  }
+  await crossProcessLock(ctx, key, async () => {
+    await ctx.storage.set(key, record)
+    try {
+      await addOutboxIndex(ctx, key)
+    } catch (error) {
+      // Never leave a record that the index cannot reach.
+      await ctx.storage.remove(key).catch(() => {})
+      throw error
+    }
+  })
 }
 
 async function updateOutbox(ctx: PostalContext, record: OutboxRecord): Promise<void> {
@@ -1005,17 +1011,21 @@ async function reconcileOutbox(ctx: PostalContext): Promise<void> {
   const records = await listOutboxRaw(ctx)
   for (const record of records) {
     if (record.status !== "delivered") continue
-    const receipt = await readReceipt(ctx, record.from, record.to, record.msgID)
-    if (!receipt) continue
-    if (receipt.status === "rejected") {
-      record.status = "rejected"
-      record.lastError = receipt.reason ?? "rejected"
-      await updateOutbox(ctx, record)
-    } else if (record.admittedAt !== receipt.verifiedAt || record.authorizedBy !== receipt.authorizedBy) {
-      record.admittedAt = receipt.verifiedAt
-      record.authorizedBy = receipt.authorizedBy
-      await updateOutbox(ctx, record)
-    }
+    await crossProcessLock(ctx, outboxKey(record.from, record.msgID), async () => {
+      const current = await getOutbox(ctx, record.msgID, record.from)
+      if (!current || current.status !== "delivered") return
+      const receipt = await readReceipt(ctx, current.from, current.to, current.msgID)
+      if (!receipt) return
+      if (receipt.status === "rejected") {
+        current.status = "rejected"
+        current.lastError = receipt.reason ?? "rejected"
+        await updateOutbox(ctx, current)
+      } else if (current.admittedAt !== receipt.verifiedAt || current.authorizedBy !== receipt.authorizedBy) {
+        current.admittedAt = receipt.verifiedAt
+        current.authorizedBy = receipt.authorizedBy
+        await updateOutbox(ctx, current)
+      }
+    })
   }
 }
 
@@ -1040,21 +1050,24 @@ async function markOutboxAcked(
   msgID: string,
   expected: { sessionID: string; peerID: string },
 ): Promise<void> {
-  await serialized(outboxLocks, `record/${expected.sessionID}/${msgID}`, async () => {
-    const record = await getOutbox(ctx, msgID, expected.sessionID)
-    if (!record) return
-    if (record.from !== expected.sessionID || record.to !== expected.peerID) return
-    if (record.status === "delivered" || record.status === "pending") {
-      record.status = "acked"
-      record.ackedAt = Date.now()
-      await updateOutbox(ctx, record)
-    }
-  })
+  await crossProcessLock(ctx, outboxKey(expected.sessionID, msgID), () =>
+    serialized(outboxLocks, `record/${expected.sessionID}/${msgID}`, async () => {
+      const record = await getOutbox(ctx, msgID, expected.sessionID)
+      if (!record) return
+      if (record.from !== expected.sessionID || record.to !== expected.peerID) return
+      if (record.status === "delivered" || record.status === "pending") {
+        record.status = "acked"
+        record.ackedAt = Date.now()
+        await updateOutbox(ctx, record)
+      }
+    }),
+  )
 }
 
 /** Retry one outbox record and persist its new state. */
 async function attemptOutbox(ctx: PostalContext, input: OutboxRecord): Promise<OutboxRecord> {
-  return serialized(outboxLocks, `record/${input.from}/${input.msgID}`, async () => {
+  return crossProcessLock(ctx, outboxKey(input.from, input.msgID), () =>
+    serialized(outboxLocks, `record/${input.from}/${input.msgID}`, async () => {
     const record = await getOutbox(ctx, input.msgID, input.from)
     if (!record) {
       return { ...input, status: "failed", lastError: "outbox record missing", nextAt: 0 }
@@ -1089,13 +1102,38 @@ async function attemptOutbox(ctx: PostalContext, input: OutboxRecord): Promise<O
         record.nextAt = Date.now() + retryDelay(record.attempts)
       }
     }
-    await updateOutbox(ctx, record)
-    return record
-  })
+      await updateOutbox(ctx, record)
+      return record
+    }),
+  )
+}
+
+async function dispatchLetter(
+  ctx: PostalContext,
+  options: {
+    from: string
+    to: string
+    body: string
+    envelope: Envelope
+    queueOnLimit?: boolean
+  },
+): Promise<{
+  ok: boolean
+  msgID: string
+  status: "delivered" | "queued" | "retry" | "failed" | "duplicate" | "rally-limit"
+  error?: string
+  nextAt?: number
+  attempts?: number
+}> {
+  return crossProcessLock(
+    ctx,
+    `msg/${encodeURIComponent(options.from)}/${encodeURIComponent(options.envelope.msgID)}`,
+    () => dispatchLetterLocked(ctx, options),
+  )
 }
 
 /** Deliver immediately, or persist a retry/queued record when delivery fails. */
-async function dispatchLetter(
+async function dispatchLetterLocked(
   ctx: PostalContext,
   options: {
     from: string
@@ -1250,9 +1288,13 @@ async function runWatchdog(
       queueOnLimit: true,
     })
     if (result.status !== "failed" && result.status !== "rally-limit") {
-      record.nudges = (record.nudges ?? 0) + 1
-      record.lastNudgeAt = now
-      await updateOutbox(ctx, record)
+      await crossProcessLock(ctx, outboxKey(record.from, record.msgID), async () => {
+        const current = await getOutbox(ctx, record.msgID, record.from)
+        if (!current) return
+        current.nudges = (current.nudges ?? 0) + 1
+        current.lastNudgeAt = now
+        await updateOutbox(ctx, current)
+      })
       nudged.push(record.msgID)
     }
   }
@@ -1279,23 +1321,27 @@ async function cleanupOutbox(
   const keys = new Set<string>()
   const receiptKeys = new Set<string>()
   for (const record of expired) {
-    const key = outboxKey(record.from, record.msgID)
-    keys.add(key)
-    await ctx.storage.remove(key)
-    const receipt = receiptKey(record.from, record.to, record.msgID)
-    receiptKeys.add(receipt)
-    await ctx.storage.remove(receipt)
-    const legacyKey = `outbox/${record.msgID}`
-    keys.add(legacyKey)
-    const legacy = await ctx.storage.get(legacyKey)
-    if (legacy && typeof legacy === "object" && (legacy as OutboxRecord).from === record.from) {
-      await ctx.storage.remove(legacyKey)
-    }
+    await crossProcessLock(ctx, outboxKey(record.from, record.msgID), async () => {
+      const key = outboxKey(record.from, record.msgID)
+      keys.add(key)
+      await ctx.storage.remove(key)
+      const receipt = receiptKey(record.from, record.to, record.msgID)
+      receiptKeys.add(receipt)
+      await ctx.storage.remove(receipt)
+      const legacyKey = `outbox/${record.msgID}`
+      keys.add(legacyKey)
+      const legacy = await ctx.storage.get(legacyKey)
+      if (legacy && typeof legacy === "object" && (legacy as OutboxRecord).from === record.from) {
+        await ctx.storage.remove(legacyKey)
+      }
+    })
   }
-  await serialized(outboxLocks, "index", async () => {
-    const index = await readOutboxIndex(ctx)
-    await writeOutboxIndex(ctx, index.filter((key) => !keys.has(key)))
-  })
+  await serialized(outboxLocks, "index", () =>
+    crossProcessLock(ctx, "outbox/index", async () => {
+      const index = await readOutboxIndex(ctx)
+      await writeOutboxIndex(ctx, index.filter((key) => !keys.has(key)))
+    }),
+  )
   await serialized(outboxLocks, "receipt-index", async () => {
     const index = await readReceiptIndex(ctx)
     const keep: string[] = []
@@ -2114,13 +2160,15 @@ async function setup(ctx: PostalContext): Promise<void> {
         if (record.from !== context.sessionID) {
           return { content: "postal: cannot resend another session's letter" }
         }
-        await removeReceipt(ctx, record.from, record.to, record.msgID)
-        record.status = "pending"
-        record.attempts = 0
-        record.nextAt = 0
-        record.lastError = undefined
-        record.queuedForWindow = false
-        await updateOutbox(ctx, record)
+        await crossProcessLock(ctx, outboxKey(record.from, record.msgID), async () => {
+          await removeReceipt(ctx, record.from, record.to, record.msgID)
+          record.status = "pending"
+          record.attempts = 0
+          record.nextAt = 0
+          record.lastError = undefined
+          record.queuedForWindow = false
+          await updateOutbox(ctx, record)
+        })
         const result = await attemptOutbox(ctx, record)
         if (result.status === "delivered") return { content: `postal: resent ${msgID}` }
         if (result.status === "failed") {
