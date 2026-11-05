@@ -167,7 +167,7 @@ type ProjectedMessage = {
 type PeerRecord = { id: string; title: string }
 type PairResult = { ok: boolean; peerID?: string; title?: string; peers?: PeerRecord[]; error?: string }
 
-type EnvelopeKind = "task" | "status" | "verify" | "error" | "letter" | "system"
+type EnvelopeKind = "task" | "assignment" | "request" | "status" | "verify" | "error" | "letter" | "system"
 type EnvelopeArtifact = { path: string; sha256?: string }
 type EnvelopeCommand = { cmd: string; exit?: number }
 type Envelope = {
@@ -269,7 +269,16 @@ function parseModel(ref: string): {
   }
 }
 
-const ENVELOPE_KINDS = new Set<EnvelopeKind>(["task", "status", "verify", "error", "letter", "system"])
+const ENVELOPE_KINDS = new Set<EnvelopeKind>([
+  "task",
+  "assignment",
+  "request",
+  "status",
+  "verify",
+  "error",
+  "letter",
+  "system",
+])
 
 function parseKind(value: unknown): EnvelopeKind | undefined {
   return typeof value === "string" && ENVELOPE_KINDS.has(value as EnvelopeKind)
@@ -1187,7 +1196,7 @@ async function attemptOutbox(ctx: PostalContext, input: OutboxRecord): Promise<O
     }
     if (record.status !== "pending") return record
     // F-08: a grant may have been revoked after the record was created.
-    const operation: Operation = record.envelope.kind === "task" ? "task" : "send"
+    const operation: Operation = record.envelope.kind === "task" || record.envelope.kind === "assignment" ? "task" : "send"
     const relation = await ensureGrant(ctx, stateLock(ctx), record.from, record.to)
     if (!relation || !isRuleActive(relation.operations[operation], operation)) {
       record.status = "revoked"
@@ -1379,7 +1388,7 @@ async function runWatchdog(
   const records = await listOutbox(ctx, options.from)
   const candidates: OutboxRecord[] = []
   for (const record of records) {
-    if (record.status !== "delivered" || record.envelope.kind !== "task") continue
+    if (record.status !== "delivered" || (record.envelope.kind !== "task" && record.envelope.kind !== "assignment")) continue
     if (now - record.createdAt < afterMs) continue
     if ((record.nudges ?? 0) >= maxNudges) continue
     if (record.lastNudgeAt && now - record.lastNudgeAt < intervalMs) continue
@@ -2280,7 +2289,10 @@ async function setup(ctx: PostalContext): Promise<void> {
         properties: {
           to: { type: "string", description: "Target session ID (ses_...). Omit when exactly one peer is connected." },
           text: { type: "string", description: "Letter body to deliver" },
-          kind: { type: "string", enum: ["task", "status", "verify", "error", "letter", "system"] },
+          kind: {
+            type: "string",
+            enum: ["task", "assignment", "request", "status", "verify", "error", "letter", "system"],
+          },
           task_id: { type: "string" },
           reply_to: { type: "string" },
           msg_id: { type: "string", description: "Idempotency key; generated when omitted" },
@@ -2380,13 +2392,13 @@ async function setup(ctx: PostalContext): Promise<void> {
           }
         }
         const relation = await ensureGrant(ctx, stateLock(ctx), context.sessionID, to)
-        const operation: Operation = kind === "task" ? "task" : "send"
+        const operation: Operation = kind === "task" || kind === "assignment" ? "task" : "send"
         if (!relation || !isRuleActive(relation.operations[operation], operation)) {
           return {
             content: `postal: ${operation} is not granted for ${to}; inspect postal_relations.`,
           }
         }
-        const effectiveTaskID = kind === "task" ? taskID ?? msgID : taskID
+        const effectiveTaskID = kind === "task" || kind === "assignment" ? taskID ?? msgID : taskID
         const envelope: Envelope = {
           kind: kind ?? "letter",
           taskID: effectiveTaskID,
@@ -2395,7 +2407,7 @@ async function setup(ctx: PostalContext): Promise<void> {
           artifacts,
           commands,
         }
-        if (kind === "task" && effectiveTaskID) {
+        if ((kind === "task" || kind === "assignment") && effectiveTaskID) {
           try {
             await createTask(ctx, stateLock(ctx), {
               from: context.sessionID,
@@ -2464,7 +2476,10 @@ async function setup(ctx: PostalContext): Promise<void> {
         type: "object",
         properties: {
           text: { type: "string" },
-          kind: { type: "string", enum: ["task", "status", "verify", "error", "letter", "system"] },
+          kind: {
+            type: "string",
+            enum: ["task", "assignment", "request", "status", "verify", "error", "letter", "system"],
+          },
           task_id: { type: "string" },
           reply_to: { type: "string" },
           msg_id: { type: "string", description: "Base idempotency key; per-peer suffixes are added" },
@@ -2525,14 +2540,18 @@ async function setup(ctx: PostalContext): Promise<void> {
             continue
           }
           const grant = await ensureGrant(ctx, stateLock(ctx), context.sessionID, peer.id)
-          const operation: Operation = kind === "task" ? "task" : "send"
+          const operation: Operation = kind === "task" || kind === "assignment" ? "task" : "send"
           if (!grant || !isRuleActive(grant.operations[operation], operation)) {
             rows.push(`${peer.id}	not-granted	${msgID}	${operation} not granted`)
             continue
           }
           const baseTaskID = value.task_id?.trim() || undefined
           const effectiveTaskID =
-            kind === "task" ? (baseTaskID ? `${baseTaskID}_${peer.id}` : msgID) : baseTaskID
+            kind === "task" || kind === "assignment"
+              ? baseTaskID
+                ? `${baseTaskID}_${peer.id}`
+                : msgID
+              : baseTaskID
           const envelope: Envelope = {
             kind: kind ?? "letter",
             taskID: effectiveTaskID,
@@ -2541,7 +2560,7 @@ async function setup(ctx: PostalContext): Promise<void> {
             artifacts,
             commands,
           }
-          if (kind === "task" && effectiveTaskID) {
+          if ((kind === "task" || kind === "assignment") && effectiveTaskID) {
             try {
               await createTask(ctx, stateLock(ctx), {
                 from: context.sessionID,
@@ -2598,7 +2617,7 @@ async function setup(ctx: PostalContext): Promise<void> {
           const nextAt = record.nextAt ? new Date(record.nextAt).toISOString() : "-"
           const admittedAt = record.admittedAt ? new Date(record.admittedAt).toISOString() : "-"
           const task =
-            record.envelope.kind === "task"
+            record.envelope.kind === "task" || record.envelope.kind === "assignment"
               ? taskMap.get(`${record.from}/${record.envelope.taskID ?? record.msgID}`)
               : undefined
           return [
@@ -3061,23 +3080,28 @@ async function setup(ctx: PostalContext): Promise<void> {
         meta.postal.reason = verification.reason
         return
       }
+      const isAssignment = kind === "task" || kind === "assignment"
       let authorizedBy: string | undefined
-      if (kind === "task") {
-        const taskGrant = from ? await ensureGrant(ctx, stateLock(ctx), from, event.sessionID) : undefined
-        authorizedBy = taskGrant && isRuleActive(taskGrant.operations.task, "task") ? from : undefined
-        if (!authorizedBy) {
+      if (kind !== "system") {
+        const grant = from ? await ensureGrant(ctx, stateLock(ctx), from, event.sessionID) : undefined
+        const operation: Operation = isAssignment ? "task" : "send"
+        if (!grant || !isRuleActive(grant.operations[operation], operation)) {
+          const reason = isAssignment ? "unauthorized_task" : "unauthorized_send"
           if (receiptBase) {
             await putReceipt(ctx, {
               ...receiptBase,
               status: "rejected",
-              reason: "unauthorized_task",
+              reason,
               verifiedAt: Date.now(),
             })
           }
           event.prompt.text = ""
-          meta.postal.reason = "unauthorized_task"
+          meta.postal.reason = reason
           return
         }
+        if (isAssignment) authorizedBy = from
+      }
+      if (isAssignment) {
         meta.postal.authorizedBy = authorizedBy
         const taskID = typeof meta.postal.taskID === "string" && meta.postal.taskID ? meta.postal.taskID : msgID
         if (taskID) {

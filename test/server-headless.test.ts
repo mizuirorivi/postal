@@ -2041,3 +2041,48 @@ describe("v2 task state", () => {
     expect(denied.content).toContain("task not found")
   })
 })
+
+describe("v2 request and assignment", () => {
+  it("uses send for requests and task for assignments", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+
+    const request = await test.tools.send.execute(
+      { to: b.id, text: "please advise", kind: "request", msg_id: "msg_request" },
+      { sessionID: "ses_a" },
+    )
+    expect(request.content).toContain("delivered")
+
+    const consult = await test.tools.send.execute(
+      { to: "ses_a", text: "consult", kind: "request", msg_id: "msg_consult_request" },
+      { sessionID: b.id },
+    )
+    expect(consult.content).toContain("delivered")
+
+    const reverse = await test.tools.send.execute(
+      { to: "ses_a", text: "forced", kind: "assignment", msg_id: "msg_reverse_assignment" },
+      { sessionID: b.id },
+    )
+    expect(reverse.content).toContain("task is not granted")
+
+    const assignment = await test.tools.send.execute(
+      {
+        to: b.id,
+        text: "do this",
+        kind: "assignment",
+        task_id: "A1",
+        msg_id: "msg_assignment",
+      },
+      { sessionID: "ses_a" },
+    )
+    expect(assignment.content).toContain("delivered")
+
+    const inbox = await test.tools.inbox.execute({}, { sessionID: "ses_a" })
+    const requestLine = inbox.content.split("\n").find((line) => line.startsWith("msg_request\t"))
+    const assignmentLine = inbox.content.split("\n").find((line) => line.startsWith("msg_assignment\t"))
+    expect(requestLine).toContain("\trequest\t-")
+    expect(assignmentLine).toContain("\tassignment\topen")
+  })
+})
