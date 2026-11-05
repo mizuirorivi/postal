@@ -26,6 +26,7 @@
  */
 import { PostalRpc } from "./rpc.js"
 import { serialized } from "./lock.js"
+import { defaultLockStorePath, openLockStore } from "./state.js"
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto"
 import { readFileSync, realpathSync, statSync } from "node:fs"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
@@ -862,6 +863,19 @@ function messageKey(from: string, msgID: string): string {
 
 function pairLockKey(a: string, b: string): string {
   return [a, b].sort().join(":")
+}
+
+/** Serialize a critical section across OpenCode server processes when SQLite is available. */
+async function crossProcessLock<T>(
+  ctx: PostalContext,
+  key: string,
+  task: () => Promise<T> | T,
+): Promise<T> {
+  const configured =
+    typeof ctx.options?.statePath === "string" ? ctx.options.statePath : defaultLockStorePath()
+  const store = await openLockStore(configured)
+  if (!store) return task()
+  return store.withLock(key, task)
 }
 
 async function readOutboxIndex(ctx: PostalContext): Promise<string[]> {
@@ -2149,23 +2163,25 @@ async function setup(ctx: PostalContext): Promise<void> {
         const rawTtl = Number((input as { ttl?: unknown }).ttl)
         const ttl = Number.isFinite(rawTtl) ? Math.max(5, Math.min(3600, Math.floor(rawTtl))) : 60
         const key = `claim/${scope}`
-        return serialized(claimLocks, scope, async () => {
-          const existing = (await ctx.storage.get(key)) as ClaimRecord | undefined
-          const now = Date.now()
-          if (existing && existing.expiresAt > now && existing.owner !== context.sessionID) {
-            return {
-              content:
-                `postal: claim busy: ${scope} is owned by ${existing.owner} ` +
-                `until ${new Date(existing.expiresAt).toISOString()}`,
+        return serialized(claimLocks, scope, () =>
+          crossProcessLock(ctx, `claim/${scope}`, async () => {
+            const existing = (await ctx.storage.get(key)) as ClaimRecord | undefined
+            const now = Date.now()
+            if (existing && existing.expiresAt > now && existing.owner !== context.sessionID) {
+              return {
+                content:
+                  `postal: claim busy: ${scope} is owned by ${existing.owner} ` +
+                  `until ${new Date(existing.expiresAt).toISOString()}`,
+              }
             }
-          }
-          await ctx.storage.set(key, {
-            scope,
-            owner: context.sessionID,
-            expiresAt: now + ttl * 1000,
-          } satisfies ClaimRecord)
-          return { content: `postal: claimed ${scope} for ${ttl}s` }
-        })
+            await ctx.storage.set(key, {
+              scope,
+              owner: context.sessionID,
+              expiresAt: now + ttl * 1000,
+            } satisfies ClaimRecord)
+            return { content: `postal: claimed ${scope} for ${ttl}s` }
+          }),
+        )
       },
     })
 
@@ -2184,15 +2200,17 @@ async function setup(ctx: PostalContext): Promise<void> {
         const scope = String((input as { scope?: unknown }).scope ?? "").trim()
         if (!scope) return { content: "postal: 'scope' is required" }
         const key = `claim/${scope}`
-        return serialized(claimLocks, scope, async () => {
-          const existing = (await ctx.storage.get(key)) as ClaimRecord | undefined
-          if (!existing) return { content: `postal: claim not held: ${scope}` }
-          if (existing.owner !== context.sessionID) {
-            return { content: `postal: claim owned by ${existing.owner}: ${scope}` }
-          }
-          await ctx.storage.remove(key)
-          return { content: `postal: released ${scope}` }
-        })
+        return serialized(claimLocks, scope, () =>
+          crossProcessLock(ctx, `claim/${scope}`, async () => {
+            const existing = (await ctx.storage.get(key)) as ClaimRecord | undefined
+            if (!existing) return { content: `postal: claim not held: ${scope}` }
+            if (existing.owner !== context.sessionID) {
+              return { content: `postal: claim owned by ${existing.owner}: ${scope}` }
+            }
+            await ctx.storage.remove(key)
+            return { content: `postal: released ${scope}` }
+          }),
+        )
       },
     })
 

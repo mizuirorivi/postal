@@ -14,6 +14,8 @@ type Prompt = {
   metadata?: Record<string, any>
 }
 
+process.env.POSTAL_STATE_PATH = join(mkdtempSync(join(tmpdir(), "postal-state-")), "state.db")
+
 const flush = () => new Promise((resolve) => setTimeout(resolve, 5))
 
 const outboxKey = (from: string, id: string) =>

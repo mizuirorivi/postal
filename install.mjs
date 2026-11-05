@@ -57,6 +57,7 @@ const files = [
   "tui.tsx",
   "rpc.ts",
   "lock.ts",
+  "state.ts",
   "fuzzy.ts",
   "sessions.ts",
   "status.ts",
