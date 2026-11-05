@@ -1,0 +1,42 @@
+{
+  "name": "Watchdog and Outbox Cleanup Context",
+  "description": "Idle-worker nudges for unacked task letters and TTL cleanup of old outbox records.",
+  "nodes": {
+    "participant-S": {
+      "name": "Retry Timer",
+      "data": {
+        "Schedule": { "type": "Text Input", "value": "15-second interval in index.ts" }
+      }
+    },
+    "participant-W": {
+      "name": "Watchdog",
+      "data": {
+        "Defaults": { "type": "Text Input", "value": "300s age, 600s interval, 2 nudges" }
+      }
+    },
+    "participant-O": {
+      "name": "Outbox KV",
+      "data": {
+        "Keys": { "type": "Text Input", "value": "outbox/index, outbox/<msgID>, msg/<msgID>" }
+      }
+    },
+    "participant-P": {
+      "name": "Presence",
+      "data": {
+        "Keys": { "type": "Text Input", "value": "presence/<sessionID>, 30s TTL" }
+      }
+    },
+    "participant-R": {
+      "name": "Worker Session",
+      "data": {
+        "Behavior": { "type": "Text Input", "value": "Receives a kind: system nudge" }
+      }
+    },
+    "participant-C": {
+      "name": "Cleanup",
+      "data": {
+        "Defaults": { "type": "Text Input", "value": "outboxTtlDays 7, dry run by default" }
+      }
+    }
+  }
+}

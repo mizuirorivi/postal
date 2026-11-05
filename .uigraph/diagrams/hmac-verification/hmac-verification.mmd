@@ -1,0 +1,39 @@
+sequenceDiagram
+  autonumber
+  title: HMAC signing and verification
+  participant A as Sender Session
+  participant P as Postal Plugin
+  participant K as HMAC KV
+  participant B as Receiver Session
+  participant O as Operator
+
+  Note over A,B: pairing created a pair key
+  A->>P: postal_send letter
+  P->>K: read current key
+  K-->>P: key and keyID
+  P->>P: sign v2 payload (keyID, issuedAt, from, to, msgID, kind, taskID, replyTo, letter)
+  P->>B: steer signed letter
+  B->>P: prompt admission hook
+  P->>K: read current and previous
+  K-->>P: candidate keys
+  alt invalid or stale
+    P->>K: write rejected receipt (authenticated reasons only)
+    P-->>B: clear body and reason
+  else signature valid
+    alt kind task
+      P->>P: check parent and ancestor
+      alt not authorized
+        P->>K: write rejected receipt (unauthorized_task)
+        P-->>B: clear body + unauthorized_task
+      else authorized
+        P->>K: write accepted receipt with authorizedBy
+        P-->>B: admit letter
+      end
+    else other kinds
+      P->>K: write accepted receipt
+      P-->>B: admit letter
+    end
+  end
+  O->>P: postal_rekey
+  P->>K: rotate key with grace
+  Note over K: old key verifies keyGraceHours

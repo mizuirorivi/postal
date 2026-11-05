@@ -1,29 +1,38 @@
 sequenceDiagram
-  title Outbox retry and ACK
-  participant SenderAI as Sender AI
-  participant postal_sendTool as postal_send Tool
-  participant OutboxKV as Outbox KV
-  participant RetryScanner as Retry Scanner
-  participant PeerSession as Peer Session
-  autonumber 1 3
-  SenderAI->>postal_sendTool: postal_send letter
-  postal_sendTool->>OutboxKV: mark delivered
-  postal_sendTool->>OutboxKV: write pending record
+  autonumber
+  title: Outbox retry and ACK
+  participant A as Sender AI
+  participant T as postal_send Tool
+  participant K as Outbox KV
+  participant R as Retry Scanner
+  participant B as Peer Session
+
+  A->>T: postal_send letter
+  T->>K: write pending record (sender-scoped)
+  T->>T: sign letter (HMAC)
+  T->>B: attempt steer
   alt delivery succeeds
-    PeerSession->>postal_sendTool: reply with reply_to
-    postal_sendTool->>PeerSession: attempt steer
-    postal_sendTool->>OutboxKV: mark acked
+    T->>K: mark delivered
+    B->>T: prompt admission hook
+    alt receiver accepts
+      B->>K: write accepted receipt
+      B->>T: reply with reply_to
+      T->>K: mark acked
+    else receiver rejects
+      B->>K: write rejected receipt
+      T->>K: reconcile to rejected
+    end
   else delivery fails
-    postal_sendTool->>OutboxKV: pending with backoff
+    T->>K: pending with backoff
     loop every 15 seconds
-      RetryScanner->>OutboxKV: list due records
-      RetryScanner->>PeerSession: retry steer
+      R->>K: list due pending records (parallel)
+      R->>B: retry steer
       alt retry succeeds
-        RetryScanner->>OutboxKV: mark delivered
+        R->>K: mark delivered
       else attempts below six
-        RetryScanner->>OutboxKV: schedule next backoff
+        R->>K: schedule next backoff
       else attempts exhausted
-        RetryScanner->>OutboxKV: mark failed
+        R->>K: mark failed
       end
     end
   end

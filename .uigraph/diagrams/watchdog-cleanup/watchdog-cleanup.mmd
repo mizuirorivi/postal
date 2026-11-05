@@ -1,0 +1,30 @@
+sequenceDiagram
+  autonumber
+  title: Watchdog and outbox cleanup
+  participant S as Retry Timer
+  participant W as Watchdog
+  participant O as Outbox KV
+  participant P as Presence
+  participant R as Worker Session
+  participant C as Cleanup
+
+  S->>W: every 15 seconds
+  W->>O: list delivered task records (rejected excluded)
+  O-->>W: unacked candidates
+  loop each candidate
+    W->>P: read worker presence
+    alt worker idle
+      W->>R: send system nudge
+      W->>O: record nudge count
+    else running or unknown
+      W->>W: skip candidate
+    end
+  end
+  S->>C: hourly check
+  C->>O: find expired records
+  alt postal_cleanup tool (default)
+    C-->>C: dry run, report only
+  else background timer or dryRun false
+    C->>O: remove expired records and receipts
+    C->>O: keep sender-scoped msg markers
+  end

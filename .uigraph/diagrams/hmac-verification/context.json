@@ -1,0 +1,36 @@
+{
+  "name": "HMAC Signing and Verification Context",
+  "description": "Per-pair HMAC keys, signature verification at prompt admission, task authorization, and rekey grace.",
+  "nodes": {
+    "participant-A": {
+      "name": "Sender Session",
+      "data": {
+        "Role": { "type": "Text Input", "value": "Calls postal_send or a mention relay" }
+      }
+    },
+    "participant-P": {
+      "name": "Postal Plugin",
+      "data": {
+        "Functions": { "type": "Text Input", "value": "signLetter, verifyLetter, isAncestorOf" }
+      }
+    },
+    "participant-K": {
+      "name": "HMAC KV",
+      "data": {
+        "Keys": { "type": "Text Input", "value": "hmac/<min>:<max> with current and previous" }
+      }
+    },
+    "participant-B": {
+      "name": "Receiver Session",
+      "data": {
+        "Behavior": { "type": "Text Input", "value": "Prompt hook clears invalid bodies before the model sees them" }
+      }
+    },
+    "participant-O": {
+      "name": "Operator",
+      "data": {
+        "Action": { "type": "Text Input", "value": "Runs postal_rekey" }
+      }
+    }
+  }
+}

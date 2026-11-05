@@ -3,7 +3,7 @@ version: 1
 service:
   name: Postal
   category: Developer Tool
-  description: Session-to-session mail for OpenCode with @mentions, tools, multi-peer pairing, and a bounded AI-to-AI rally.
+  description: Session-to-session mail for OpenCode with signed letters, multi-peer pairing, and bounded AI-to-AI rallies.
   repository:
     provider: github
     url: https://github.com/mizuirorivi/postal.git
@@ -41,6 +41,12 @@ architectureDiagrams:
   - name: Worker Spawn
     path: .uigraph/diagrams/worker-spawn/worker-spawn.mmd
     contextPath: .uigraph/diagrams/worker-spawn/context.json
+  - name: HMAC Signing and Verification
+    path: .uigraph/diagrams/hmac-verification/hmac-verification.mmd
+    contextPath: .uigraph/diagrams/hmac-verification/context.json
+  - name: Watchdog and Outbox Cleanup
+    path: .uigraph/diagrams/watchdog-cleanup/watchdog-cleanup.mmd
+    contextPath: .uigraph/diagrams/watchdog-cleanup/context.json
 
 docs:
   - name: Postal Service Overview
