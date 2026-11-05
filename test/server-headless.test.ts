@@ -20,7 +20,7 @@ function harness() {
   const prompts: Prompt[] = []
   const sessions = new Map<string, Session>()
   const notes = new Map<string, string>()
-  const hooks: Record<string, (event: any) => void> = {}
+  const hooks: Record<string, (event: any) => void | Promise<void>> = {}
   const rpc: Record<string, (input: any) => Promise<any>> = {}
   const tools: Record<string, { execute: (input: any, context: any) => Promise<{ content: string }> }> = {}
   const creates: any[] = []
@@ -497,12 +497,19 @@ describe("persistent outbox", () => {
       { to: "ses_b", text: "please ack", msg_id: "msg_ack" },
       { sessionID: "ses_a" },
     )
-    test.hooks.prompt({
+    await test.tools.send.execute(
+      { to: "ses_a", text: "ack", reply_to: "msg_ack" },
+      { sessionID: "ses_b" },
+    )
+    const reply = test.prompts.at(-1)!
+    const event = {
       sessionID: "ses_a",
-      prompt: { text: "[postal] reply" },
-      metadata: { postal: { relay: true, replyTo: "msg_ack" } },
-    })
+      prompt: { text: reply.text },
+      metadata: structuredClone(reply.metadata),
+    }
+    await test.hooks.prompt(event)
     await flush()
+    expect(event.prompt.text).toBe(reply.text)
 
     const inbox = await test.tools.inbox.execute({}, { sessionID: "ses_a" })
     expect(inbox.content).toContain("msg_ack")
@@ -767,5 +774,124 @@ describe("orphanPolicy", () => {
     expect(test.removes).toContain(c.id)
     expect(test.sessions.has(c.id)).toBe(false)
     expect(test.prompts.some((prompt) => prompt.metadata?.postal?.kind === "system")).toBe(false)
+  })
+})
+
+describe("HMAC Phase 1", () => {
+  it("accepts a valid signature and rejects tampering", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.tools.send.execute({ to: "ses_b", text: "signed body", msg_id: "msg_signed" }, { sessionID: "ses_a" })
+    const sent = test.prompts.at(-1)!
+
+    const valid = {
+      sessionID: "ses_b",
+      prompt: { text: sent.text },
+      metadata: structuredClone(sent.metadata),
+    }
+    await test.hooks.prompt(valid)
+    expect(valid.prompt.text).toBe(sent.text)
+    expect((valid.metadata as any).postal.reason).toBeUndefined()
+
+    const tampered = {
+      sessionID: "ses_b",
+      prompt: { text: `${sent.text}\ntampered` },
+      metadata: structuredClone(sent.metadata),
+    }
+    await test.hooks.prompt(tampered)
+    expect(tampered.prompt.text).toBe("")
+    expect((tampered.metadata as any).postal.reason).toBe("invalid_signature")
+  })
+
+  it("rejects relay messages without a signature", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+
+    const event = {
+      sessionID: "ses_b",
+      prompt: { text: "[postal] unsigned" },
+      metadata: { postal: { relay: true, from: "ses_a" } },
+    }
+    await test.hooks.prompt(event)
+
+    expect(event.prompt.text).toBe("")
+    expect((event.metadata as any).postal.reason).toBe("missing_signature")
+  })
+
+  it("allows task letters only from the parent or an ancestor", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_c", "C")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+
+    await test.tools.send.execute(
+      { to: b.id, text: "task from parent", kind: "task" },
+      { sessionID: "ses_a" },
+    )
+    const fromParent = test.prompts.at(-1)!
+    const parentEvent = {
+      sessionID: b.id,
+      prompt: { text: fromParent.text },
+      metadata: structuredClone(fromParent.metadata),
+    }
+    await test.hooks.prompt(parentEvent)
+    expect(parentEvent.prompt.text).toBe(fromParent.text)
+    expect((parentEvent.metadata as any).postal.reason).toBeUndefined()
+
+    await test.rpc.connect({ sessionID: "ses_c", peerID: b.id })
+    await test.tools.send.execute(
+      { to: b.id, text: "task from non-parent", kind: "task" },
+      { sessionID: "ses_c" },
+    )
+    const fromPeer = test.prompts.at(-1)!
+    const peerEvent = {
+      sessionID: b.id,
+      prompt: { text: fromPeer.text },
+      metadata: structuredClone(fromPeer.metadata),
+    }
+    await test.hooks.prompt(peerEvent)
+    expect(peerEvent.prompt.text).toBe("")
+    expect((peerEvent.metadata as any).postal.reason).toBe("unauthorized_task")
+  })
+
+  it("rotates keys and keeps the old key valid for the grace period", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.tools.send.execute({ to: "ses_b", text: "old key", msg_id: "msg_old" }, { sessionID: "ses_a" })
+    const oldLetter = test.prompts.at(-1)!
+
+    const rekeyed = await test.tools.rekey.execute({ peerID: "ses_b" }, { sessionID: "ses_a" })
+    expect(rekeyed.content).toContain("new keyID")
+    const hmacKey = [...test.storage.keys()].find((key) => key.startsWith("hmac/"))
+    expect(hmacKey).toBeDefined()
+    const record = test.storage.get(hmacKey!) as any
+    expect(record.previous).toHaveLength(1)
+    expect(record.previous[0].validUntil).toBeGreaterThan(Date.now())
+
+    const oldEvent = {
+      sessionID: "ses_b",
+      prompt: { text: oldLetter.text },
+      metadata: structuredClone(oldLetter.metadata),
+    }
+    await test.hooks.prompt(oldEvent)
+    expect(oldEvent.prompt.text).toBe(oldLetter.text)
+
+    await test.tools.send.execute({ to: "ses_b", text: "new key", msg_id: "msg_new" }, { sessionID: "ses_a" })
+    const newLetter = test.prompts.at(-1)!
+    const newEvent = {
+      sessionID: "ses_b",
+      prompt: { text: newLetter.text },
+      metadata: structuredClone(newLetter.metadata),
+    }
+    await test.hooks.prompt(newEvent)
+    expect(newEvent.prompt.text).toBe(newLetter.text)
+    expect((newEvent.metadata as any).postal.reason).toBeUndefined()
   })
 })

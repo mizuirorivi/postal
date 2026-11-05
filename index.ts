@@ -26,7 +26,7 @@
  */
 import { PostalRpc } from "./rpc.js"
 import { serialized } from "./lock.js"
-import { createHash } from "node:crypto"
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto"
 import { existsSync, readFileSync } from "node:fs"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -48,6 +48,10 @@ type PostalMeta = {
     msgID?: string
     replyTo?: string
     kind?: string
+    signature?: string
+    keyID?: string
+    issuedAt?: number
+    reason?: string
     peer?: { id?: string; title?: string }
   }
 }
@@ -66,7 +70,7 @@ type PostalContext = {
   location: { directory: string }
   options?: Record<string, unknown>
   session: {
-    hook(name: "prompt", callback: (event: PromptEvent) => void): Promise<unknown>
+    hook(name: "prompt", callback: (event: PromptEvent) => void | Promise<void>): Promise<unknown>
     list(input?: Record<string, unknown>): Promise<{ data: Array<{ id: string; title?: string }> }>
     get(input: { sessionID: string }): Promise<{ id: string; title?: string }>
     create?(input: {
@@ -142,6 +146,9 @@ type PresenceRecord = {
 }
 
 type ParentRecord = { parentID: string; createdAt: number }
+
+type HmacKey = { keyID: string; key: string; createdAt: number; validUntil?: number }
+type HmacRecord = { current: HmacKey; previous: HmacKey[] }
 
 type OutboxStatus = "pending" | "delivered" | "acked" | "failed"
 type OutboxRecord = {
@@ -429,6 +436,112 @@ async function readPresence(ctx: PostalContext, sessionID: string): Promise<Pres
   return record
 }
 
+const hmacLocks = new Map<string, Promise<unknown>>()
+
+function hmacWindowMs(ctx: PostalContext): number {
+  const configured = Number(ctx.options?.hmacWindowSeconds)
+  const seconds = Number.isFinite(configured) && configured > 0 ? configured : 120
+  return Math.max(30, Math.min(3600, seconds)) * 1000
+}
+
+function keyGraceMs(ctx: PostalContext): number {
+  const configured = Number(ctx.options?.keyGraceHours)
+  const hours = Number.isFinite(configured) && configured > 0 ? configured : 24
+  return Math.max(1, Math.min(168, hours)) * 60 * 60 * 1000
+}
+
+function newHmacKey(): HmacKey {
+  return {
+    keyID: `hk_${Date.now().toString(36)}_${randomBytes(4).toString("hex")}`,
+    key: randomBytes(32).toString("base64"),
+    createdAt: Date.now(),
+  }
+}
+
+function hmacStorageKey(a: string, b: string): string {
+  return `hmac/${rallyKey(a, b)}`
+}
+
+async function readHmacRecord(ctx: PostalContext, a: string, b: string): Promise<HmacRecord | undefined> {
+  const value = await ctx.storage.get(hmacStorageKey(a, b))
+  if (!value || typeof value !== "object") return undefined
+  const record = value as HmacRecord
+  if (!record.current || typeof record.current.key !== "string" || typeof record.current.keyID !== "string") {
+    return undefined
+  }
+  return { current: record.current, previous: Array.isArray(record.previous) ? record.previous : [] }
+}
+
+/** Create the pair key once; pairing itself also calls this. */
+async function ensureHmacRecord(ctx: PostalContext, a: string, b: string): Promise<HmacRecord> {
+  return serialized(hmacLocks, hmacStorageKey(a, b), async () => {
+    const existing = await readHmacRecord(ctx, a, b)
+    if (existing) return existing
+    const record: HmacRecord = { current: newHmacKey(), previous: [] }
+    await ctx.storage.set(hmacStorageKey(a, b), record)
+    return record
+  })
+}
+
+async function signLetter(
+  ctx: PostalContext,
+  from: string,
+  to: string,
+  letter: string,
+): Promise<{ signature: string; keyID: string; issuedAt: number }> {
+  const record = await ensureHmacRecord(ctx, from, to)
+  const issuedAt = Date.now()
+  const signature = createHmac("sha256", record.current.key)
+    .update(`${record.current.keyID}\n${issuedAt}\n${letter}`)
+    .digest("hex")
+  return { signature, keyID: record.current.keyID, issuedAt }
+}
+
+async function verifyLetter(
+  ctx: PostalContext,
+  from: string,
+  to: string,
+  letter: string,
+  meta: { signature?: string; keyID?: string; issuedAt?: number },
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (!from || !meta.signature || !meta.keyID || typeof meta.issuedAt !== "number") {
+    return { ok: false, reason: "missing_signature" }
+  }
+  if (Math.abs(Date.now() - meta.issuedAt) > hmacWindowMs(ctx)) {
+    return { ok: false, reason: "stale_signature" }
+  }
+  const record = await readHmacRecord(ctx, from, to)
+  if (!record) return { ok: false, reason: "unknown_key" }
+  const now = Date.now()
+  const candidates = [record.current, ...record.previous].filter(
+    (key) => key.keyID === meta.keyID && (key.keyID === record.current.keyID || !key.validUntil || key.validUntil > now),
+  )
+  if (candidates.length === 0) return { ok: false, reason: "unknown_key" }
+  const expected = createHmac("sha256", candidates[0].key)
+    .update(`${meta.keyID}\n${meta.issuedAt}\n${letter}`)
+    .digest("hex")
+  if (expected.length !== meta.signature.length) return { ok: false, reason: "invalid_signature" }
+  try {
+    if (!timingSafeEqual(Buffer.from(expected), Buffer.from(meta.signature))) {
+      return { ok: false, reason: "invalid_signature" }
+    }
+  } catch {
+    return { ok: false, reason: "invalid_signature" }
+  }
+  return { ok: true }
+}
+
+async function isAncestorOf(ctx: PostalContext, actor: string, target: string): Promise<boolean> {
+  let current = target
+  for (let depth = 0; depth < 16; depth += 1) {
+    const parent = await readParent(ctx, current)
+    if (!parent) return false
+    if (parent.parentID === actor) return true
+    current = parent.parentID
+  }
+  return false
+}
+
 /** Deliver a letter immediately (no waiting); the peer replies with postal_send. */
 async function postOnly(
   ctx: PostalContext,
@@ -493,6 +606,7 @@ async function postOnly(
     }
   }
 
+  const signed = await signLetter(ctx, options.from, options.to, letter)
   await ctx.session.prompt({
     sessionID: options.to,
     text: letter,
@@ -505,6 +619,9 @@ async function postOnly(
         msgID: envelope.msgID,
         replyTo: envelope.replyTo,
         kind: envelope.kind,
+        signature: signed.signature,
+        keyID: signed.keyID,
+        issuedAt: signed.issuedAt,
       },
     },
   })
@@ -867,6 +984,7 @@ async function pair(ctx: PostalContext, from: string, peerID: string): Promise<P
     ])
     await addPeer(ctx, from, { id: peerID, title: peer.title ?? "" })
     await addPeer(ctx, peerID, { id: from, title: self.title ?? "" })
+    await ensureHmacRecord(ctx, from, peerID)
     await Promise.all([refreshNote(ctx, from), refreshNote(ctx, peerID)])
     return { ok: true, peerID, title: peer.title ?? "" }
   } catch (error) {
@@ -1634,6 +1752,58 @@ async function setup(ctx: PostalContext): Promise<void> {
     })
 
     editor.add({
+      name: "rekey",
+      description:
+        "Rotate the HMAC key for a connected peer. The old key verifies for keyGraceHours " +
+        "and new letters use the new key immediately.",
+      input: {
+        type: "object",
+        properties: {
+          peerID: { type: "string", description: "Peer session ID; required when multiple peers are connected" },
+        },
+        additionalProperties: false,
+      },
+      execute: async (input, context) => {
+        let peerID = String((input as { peerID?: unknown }).peerID ?? "").trim()
+        if (!peerID) {
+          const peers = (await peerStatus(ctx, context.sessionID)).peers ?? []
+          if (peers.length === 1) peerID = peers[0]!.id
+          else if (peers.length === 0) return { content: "postal: no connected peers" }
+          else return { content: "postal: multiple peers connected; pass peerID explicitly" }
+        }
+        const peers = (await peerStatus(ctx, context.sessionID)).peers ?? []
+        if (!peers.some((peer) => peer.id === peerID)) {
+          return { content: `postal: peer not connected: ${peerID}` }
+        }
+        const key = hmacStorageKey(context.sessionID, peerID)
+        const result = await serialized(hmacLocks, key, async () => {
+          const existing = await readHmacRecord(ctx, context.sessionID, peerID)
+          if (!existing) {
+            const current = newHmacKey()
+            await ctx.storage.set(key, { current, previous: [] } satisfies HmacRecord)
+            return { keyID: current.keyID, oldKeyID: undefined as string | undefined, graceUntil: undefined as number | undefined }
+          }
+          const now = Date.now()
+          const graceUntil = now + keyGraceMs(ctx)
+          const previous = [
+            { ...existing.current, validUntil: graceUntil },
+            ...existing.previous.filter((old) => !old.validUntil || old.validUntil > now),
+          ]
+          const current = newHmacKey()
+          await ctx.storage.set(key, { current, previous } satisfies HmacRecord)
+          return { keyID: current.keyID, oldKeyID: existing.current.keyID, graceUntil }
+        })
+        return {
+          content:
+            `postal: rekeyed ${peerID}; new keyID ${result.keyID}` +
+            (result.oldKeyID && result.graceUntil
+              ? `; old ${result.oldKeyID} verifies until ${new Date(result.graceUntil).toISOString()}`
+              : ""),
+        }
+      },
+    })
+
+    editor.add({
       name: "interrupt",
       description: "Interrupt a running session. Defaults to this session.",
       input: {
@@ -1721,7 +1891,7 @@ async function setup(ctx: PostalContext): Promise<void> {
   // Mention path: "@ses_XXXX ..." in a user prompt forwards the rest of the text.
   // Relay deliveries from this plugin are marked and never re-forwarded.
   // Connect handshake (from the TUI command) carries metadata.postal.connect.
-  await ctx.session.hook("prompt", (event) => {
+  await ctx.session.hook("prompt", async (event) => {
     const meta = event.metadata as PostalMeta | undefined
     if (meta?.postal?.resetRally) {
       if (event.sessionID) {
@@ -1755,6 +1925,26 @@ async function setup(ctx: PostalContext): Promise<void> {
       return
     }
     if (meta?.postal?.relay) {
+      const verification = await verifyLetter(
+        ctx,
+        String(meta.postal.from ?? ""),
+        event.sessionID,
+        event.prompt?.text ?? "",
+        meta.postal,
+      )
+      if (!verification.ok) {
+        event.prompt.text = ""
+        meta.postal.reason = verification.reason
+        return
+      }
+      if (meta.postal.kind === "task") {
+        const from = meta.postal.from
+        if (!from || !(await isAncestorOf(ctx, from, event.sessionID))) {
+          event.prompt.text = ""
+          meta.postal.reason = "unauthorized_task"
+          return
+        }
+      }
       for (const msgID of [meta.postal.msgID, meta.postal.replyTo]) {
         if (typeof msgID === "string" && msgID.length > 0) void markOutboxAcked(ctx, msgID)
       }

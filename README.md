@@ -26,6 +26,7 @@ its own model, agent, permissions, and tab.
 - `postal_send` tool for AI-to-AI letters (non-blocking)
 - `postal_directory`, `postal_peers`, and `postal_spawn` tools for address discovery and worker creation
 - Structured envelopes (`kind`, `task_id`, `reply_to`, artifacts, commands, `msg_id`)
+- HMAC Phase 1: per-pair keys, signed envelopes, ±120s window, 24h key grace, task parent/ancestor allowlist
 - `postal_status` (rally budget / last letter / busy-idle / inbox count) and `postal_log` (postal audit)
 - TUI presence bridge for live busy/idle and pending-inbox metadata
 - Artifact existence + sha256 verification on `verify` letters
@@ -209,6 +210,23 @@ This is a delivery queue, not the AI's pending inbox. When the rally limit is
 reached, pass `queueOnLimit: true` to retry after the window instead of
 rejecting the letter.
 
+### HMAC Phase 1
+
+Pairing creates a 32-byte HMAC-SHA256 key per pair (same location only). Every
+letter is signed over `keyID`, `issued_at`, and the rendered letter. The receiver
+verifies before the AI sees it:
+
+- `issued_at` must be within `hmacWindowSeconds` (default 120; clamp 30–3600)
+- an invalid or missing signature clears the body and records
+  `reason` (`invalid_signature`, `missing_signature`, `stale_signature`,
+  `unknown_key`) in `postal` metadata
+- `kind: "task"` is accepted only from the target's parent or an ancestor
+- `postal_rekey` rotates a pair key; the old key verifies for `keyGraceHours`
+  (default 24; clamp 1–168), then expires
+
+Manual root sessions have no parent, so agents cannot send them `kind: "task"`
+letters. This is intentional least privilege.
+
 ### Claims and lifecycle
 
 `postal_claim({ scope, ttl })` takes an advisory lock for a path or task.
@@ -255,9 +273,12 @@ and rally accounting.
 - **Presence payload**: only item IDs, types, and source session IDs cross the
   TUI→server bridge; message bodies stay in the TUI. Body previews are an
   explicit future opt-in.
-- **Trust boundary**: any paired peer can send a `task` letter. HMAC signatures
-  and commander allowlists are not implemented yet; pair only trusted sessions
-  and use permissions/separate projects for isolation.
+- **HMAC Phase 1** authenticates the pair, not intent: a compromised peer with
+  the pair key can still sign a malicious task. Task letters are additionally
+  limited to parent/ancestor sessions. Keys live in the plugin KV and are
+  same-location only; cross-location key distribution is Phase 2.
+- **Manual root sessions** cannot receive `kind: "task"` from agents because
+  they have no parent. Use the TUI or create a spawned worker.
 
 ### Ctrl+P commands
 
@@ -340,7 +361,9 @@ Pass plugin options with the object form:
         "maxRally": 10,
         "rallyWindowMinutes": 10,
         "allowAncestorCommands": false,
-        "orphanPolicy": "reparent"
+        "orphanPolicy": "reparent",
+        "hmacWindowSeconds": 120,
+        "keyGraceHours": 24
       }
     }
   ]
@@ -351,7 +374,8 @@ Pass plugin options with the object form:
 `rallyWindowMinutes` is the rolling window (default 10). Both are per-pair.
 `allowAncestorCommands` lets any ancestor interrupt/close a descendant; the
 default is direct-parent only. `orphanPolicy` is `reparent` (default),
-`terminate`, or `detach`.
+`terminate`, or `detach`. `hmacWindowSeconds` (default 120) bounds signature
+age; `keyGraceHours` (default 24) keeps a rotated key valid for verification.
 
 ## Security model
 

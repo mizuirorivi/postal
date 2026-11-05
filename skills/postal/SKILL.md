@@ -70,6 +70,16 @@ pending-inbox metadata (item ID, type, source only). Presence is published by
 the TUI, expires after 30 seconds, and is `unknown` for headless sessions.
 Use `postal_log` for recent `[postal]` messages from a transcript.
 
+## HMAC Phase 1
+
+Pairing creates a per-pair HMAC-SHA256 key (same location only). Every letter is
+signed; the receiver verifies before the AI sees it. `issued_at` is accepted
+within `hmacWindowSeconds` (default 120). Invalid signatures clear the body and
+set `postal.reason` metadata. `kind: "task"` is accepted only from the target's
+parent or an ancestor. `postal_rekey` rotates a key; the old key verifies for
+`keyGraceHours` (default 24). A compromised pair key can still sign malicious
+tasks; permissions remain the real boundary.
+
 ## Reliability and coordination
 
 - Every `postal_send` enters the outbox first. Failed deliveries are retried
