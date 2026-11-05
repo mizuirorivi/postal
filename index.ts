@@ -29,6 +29,16 @@ import { PostalRpc } from "./rpc.js"
 import { serialized } from "./lock.js"
 import { defaultLockStorePath, openLockStore } from "./state.js"
 import {
+  createTask,
+  findTasks,
+  isTerminalTask,
+  listTasks,
+  readTask,
+  TASK_STATUSES,
+  updateTask,
+  type TaskStatus,
+} from "./tasks.js"
+import {
   allowedOperations,
   ensureGrant,
   grantOperations,
@@ -1367,14 +1377,16 @@ async function runWatchdog(
   const nudgeUnknown = options.nudgeUnknown === true || ctx.options?.watchdogNudgeUnknown === true
   const now = Date.now()
   const records = await listOutbox(ctx, options.from)
-  const candidates = records.filter(
-    (record) =>
-      record.status === "delivered" &&
-      record.envelope.kind === "task" &&
-      now - record.createdAt >= afterMs &&
-      (record.nudges ?? 0) < maxNudges &&
-      (!record.lastNudgeAt || now - record.lastNudgeAt >= intervalMs),
-  )
+  const candidates: OutboxRecord[] = []
+  for (const record of records) {
+    if (record.status !== "delivered" || record.envelope.kind !== "task") continue
+    if (now - record.createdAt < afterMs) continue
+    if ((record.nudges ?? 0) >= maxNudges) continue
+    if (record.lastNudgeAt && now - record.lastNudgeAt < intervalMs) continue
+    const work = await readTask(ctx, record.from, record.envelope.taskID ?? record.msgID)
+    if (work && isTerminalTask(work.status)) continue
+    candidates.push(record)
+  }
   const nudged: string[] = []
   if (options.dryRun) return { candidates, nudged }
 
@@ -1852,6 +1864,7 @@ async function setup(ctx: PostalContext): Promise<void> {
         if (status.ok === false) return { content: `postal: status failed: ${status.error ?? "unknown error"}` }
         const peers = status.peers ?? []
         const outbox = await listOutbox(ctx, target)
+        const tasks = await listTasks(ctx, target)
         const selfPresence = await readPresence(ctx, target)
         const parent = await readParent(ctx, target)
         const rows = await Promise.all(
@@ -1876,6 +1889,7 @@ async function setup(ctx: PostalContext): Promise<void> {
             `OUTBOX_PENDING\t${outbox.filter((record) => record.status === "pending").length}`,
             `OUTBOX_REJECTED\t${outbox.filter((record) => record.status === "rejected").length}`,
             `OUTBOX_REVOKED\t${outbox.filter((record) => record.status === "revoked").length}`,
+            `OUTBOX_TASKS_OPEN\t${tasks.filter((task) => !isTerminalTask(task.status)).length}`,
             "PEER_ID\tTITLE\tRALLY_REMAINING\tLAST_LETTER\tRALLY_RESET_AT\tSTATE\tINBOX_COUNT\tPRESENCE_AT",
             ...rows,
           ].join("\n"),
@@ -2001,6 +2015,66 @@ async function setup(ctx: PostalContext): Promise<void> {
         const grant = await revokeOperations(ctx, stateLock(ctx), context.sessionID, to, operations)
         if (!grant) return { content: `postal: no grant for ${to}` }
         return { content: `postal: revoked ${operations?.join(",") ?? "all"} for ${to}` }
+      },
+    })
+
+    editor.add({
+      name: "task",
+      description:
+        "Update a task's work state (open/in_progress/blocked/done/cancelled). " +
+        "Message ACK and task completion are separate.",
+      input: {
+        type: "object",
+        properties: {
+          task_id: { type: "string" },
+          status: { type: "string", enum: [...TASK_STATUSES] },
+          note: { type: "string" },
+          from: { type: "string", description: "Assigner session ID when task IDs collide" },
+        },
+        required: ["task_id", "status"],
+        additionalProperties: false,
+      },
+      execute: async (input, context) => {
+        const value = input as { task_id?: string; status?: string; note?: string; from?: string }
+        const taskID = value.task_id?.trim()
+        if (!taskID) return { content: "postal: 'task_id' is required" }
+        if (!value.status || !(TASK_STATUSES as readonly string[]).includes(value.status)) {
+          return { content: `postal: invalid task status: ${value.status ?? "(missing)"}` }
+        }
+        const matches = await findTasks(ctx, context.sessionID, taskID)
+        if (matches.length === 0) return { content: `postal: task not found: ${taskID}` }
+        const chosen = value.from?.trim()
+          ? matches.find((task) => task.from === value.from?.trim())
+          : matches.length === 1
+            ? matches[0]
+            : undefined
+        if (!chosen) {
+          return {
+            content: `postal: multiple tasks named ${taskID}; pass 'from' (${matches
+              .map((task) => task.from)
+              .join(", ")})`,
+          }
+        }
+        if (chosen.from !== context.sessionID && chosen.to !== context.sessionID) {
+          return { content: "postal: not authorized to update this task" }
+        }
+        const updated = await updateTask(
+          ctx,
+          stateLock(ctx),
+          chosen.from,
+          chosen.taskID,
+          value.status as TaskStatus,
+          value.note,
+        )
+        return {
+          content: [
+            `TASK_ID\t${updated.taskID}`,
+            `FROM\t${updated.from}`,
+            `TO\t${updated.to}`,
+            `STATUS\t${updated.status}`,
+            `UPDATED_AT\t${new Date(updated.updatedAt).toISOString()}`,
+          ].join("\n"),
+        }
       },
     })
 
@@ -2312,13 +2386,26 @@ async function setup(ctx: PostalContext): Promise<void> {
             content: `postal: ${operation} is not granted for ${to}; inspect postal_relations.`,
           }
         }
+        const effectiveTaskID = kind === "task" ? taskID ?? msgID : taskID
         const envelope: Envelope = {
           kind: kind ?? "letter",
-          taskID,
+          taskID: effectiveTaskID,
           replyTo,
           msgID,
           artifacts,
           commands,
+        }
+        if (kind === "task" && effectiveTaskID) {
+          try {
+            await createTask(ctx, stateLock(ctx), {
+              from: context.sessionID,
+              to,
+              msgID,
+              taskID: effectiveTaskID,
+            })
+          } catch (error) {
+            return { content: `postal: task failed: ${errorText(error)}` }
+          }
         }
         const result = await dispatchLetter(ctx, {
           from: context.sessionID,
@@ -2443,13 +2530,29 @@ async function setup(ctx: PostalContext): Promise<void> {
             rows.push(`${peer.id}	not-granted	${msgID}	${operation} not granted`)
             continue
           }
+          const baseTaskID = value.task_id?.trim() || undefined
+          const effectiveTaskID =
+            kind === "task" ? (baseTaskID ? `${baseTaskID}_${peer.id}` : msgID) : baseTaskID
           const envelope: Envelope = {
             kind: kind ?? "letter",
-            taskID: value.task_id?.trim() || undefined,
+            taskID: effectiveTaskID,
             replyTo: value.reply_to?.trim() || undefined,
             msgID,
             artifacts,
             commands,
+          }
+          if (kind === "task" && effectiveTaskID) {
+            try {
+              await createTask(ctx, stateLock(ctx), {
+                from: context.sessionID,
+                to: peer.id,
+                msgID,
+                taskID: effectiveTaskID,
+              })
+            } catch (error) {
+              rows.push(`${peer.id}	error	${msgID}	${errorText(error)}`)
+              continue
+            }
           }
           const result = await dispatchLetter(ctx, {
             from: context.sessionID,
@@ -2489,9 +2592,15 @@ async function setup(ctx: PostalContext): Promise<void> {
         const records = (await listOutbox(ctx, target))
           .sort((left, right) => right.createdAt - left.createdAt)
           .slice(0, limit)
+        const tasks = await listTasks(ctx, target)
+        const taskMap = new Map(tasks.map((task) => [`${task.from}/${task.taskID}`, task]))
         const outboxRows = records.map((record) => {
           const nextAt = record.nextAt ? new Date(record.nextAt).toISOString() : "-"
           const admittedAt = record.admittedAt ? new Date(record.admittedAt).toISOString() : "-"
+          const task =
+            record.envelope.kind === "task"
+              ? taskMap.get(`${record.from}/${record.envelope.taskID ?? record.msgID}`)
+              : undefined
           return [
             record.msgID,
             record.to,
@@ -2499,6 +2608,7 @@ async function setup(ctx: PostalContext): Promise<void> {
             record.attempts,
             nextAt,
             record.envelope.kind,
+            task?.status ?? "-",
             admittedAt,
             record.authorizedBy ?? "-",
             record.lastError ?? "",
@@ -2518,7 +2628,7 @@ async function setup(ctx: PostalContext): Promise<void> {
         )
         const sections = [
           "--- outbox ---",
-          "MSG_ID\tTO\tSTATUS\tATTEMPTS\tNEXT_AT\tKIND\tADMITTED_AT\tAUTHORIZED_BY\tLAST_ERROR",
+          "MSG_ID\tTO\tSTATUS\tATTEMPTS\tNEXT_AT\tKIND\tTASK_STATUS\tADMITTED_AT\tAUTHORIZED_BY\tLAST_ERROR",
           ...(outboxRows.length > 0 ? outboxRows : ["(empty)"]),
           "--- peer inbox ---",
           "PEER_ID\tTITLE\tSTATE\tINBOX_COUNT",
@@ -2969,6 +3079,18 @@ async function setup(ctx: PostalContext): Promise<void> {
           return
         }
         meta.postal.authorizedBy = authorizedBy
+        const taskID = typeof meta.postal.taskID === "string" && meta.postal.taskID ? meta.postal.taskID : msgID
+        if (taskID) {
+          await createTask(ctx, stateLock(ctx), {
+            from,
+            to: event.sessionID,
+            msgID,
+            taskID,
+          }).catch(() => {
+            // The sender-side task record is authoritative; a conflict here is
+            // reported by the receipt/task tooling, not by dropping the letter.
+          })
+        }
       }
       // R-03: reject a replay of an already admitted msgID. The seen marker is
       // written only after signature and task authorization succeed.

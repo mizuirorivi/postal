@@ -1976,3 +1976,68 @@ describe("v2 delivery policy", () => {
     expect(result.content).toContain("delivery failed")
   })
 })
+
+describe("v2 task state", () => {
+  it("keeps task state separate from message ACK", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+    await test.tools.send.execute(
+      { to: b.id, text: "task", kind: "task", task_id: "T1", msg_id: "msg_task_state" },
+      { sessionID: "ses_a" },
+    )
+    const before = await test.tools.inbox.execute({}, { sessionID: "ses_a" })
+    expect(before.content).toContain("TASK_STATUS")
+    expect(before.content).toContain("open")
+
+    await test.tools.send.execute(
+      { to: "ses_a", text: "ack", reply_to: "msg_task_state", msg_id: "msg_task_ack" },
+      { sessionID: b.id },
+    )
+    const reply = test.prompts.at(-1)!
+    await test.hooks.prompt({
+      sessionID: "ses_a",
+      prompt: { text: reply.text },
+      metadata: structuredClone(reply.metadata),
+    })
+    await flush()
+    const acked = await test.tools.inbox.execute({}, { sessionID: "ses_a" })
+    expect(acked.content).toContain("acked")
+    expect(acked.content).toContain("open")
+
+    const done = await test.tools.task.execute({ task_id: "T1", status: "done" }, { sessionID: "ses_a" })
+    expect(done.content).toContain("STATUS\tdone")
+    expect((await test.tools.inbox.execute({}, { sessionID: "ses_a" })).content).toContain("done")
+  })
+
+  it("stops watchdog nudges for a completed task", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+    await test.rpc.presence({ sessions: [{ id: b.id, title: "B", state: "idle", pending: [] }] })
+    await test.tools.send.execute(
+      { to: b.id, text: "task", kind: "task", task_id: "T1", msg_id: "msg_task_done" },
+      { sessionID: "ses_a" },
+    )
+    await test.tools.task.execute({ task_id: "T1", status: "done" }, { sessionID: "ses_a" })
+    const watchdog = await test.tools.watchdog.execute({ afterSeconds: 0 }, { sessionID: "ses_a" })
+    expect(watchdog.content).not.toContain("msg_task_done")
+    expect(watchdog.content).toContain("NUDGED\t-")
+  })
+
+  it("does not let an unrelated session update a task", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_c", "C")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+    await test.tools.send.execute(
+      { to: b.id, text: "task", kind: "task", task_id: "T1", msg_id: "msg_task_owner" },
+      { sessionID: "ses_a" },
+    )
+    const denied = await test.tools.task.execute({ task_id: "T1", status: "done" }, { sessionID: "ses_c" })
+    expect(denied.content).toContain("task not found")
+  })
+})
