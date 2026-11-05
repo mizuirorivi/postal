@@ -2051,6 +2051,68 @@ describe("v2 approvals", () => {
     expect(approverAudit.content).toContain("approval_approve")
   })
 
+  it("binds an approval to its parameters and executor", async () => {
+    const { test, a, b } = await setupChain()
+
+    // Ask for a close approval that carries parameters the action never sends.
+    const withParams = await test.tools.request_approval.execute(
+      { operation: "close", resource: b.id, parameters: { force: true } },
+      { sessionID: a.id },
+    )
+    const paramsID = approvalID(withParams.content)
+    await test.tools.approve.execute({ approval_id: paramsID }, { sessionID: "ses_root" })
+    const mismatch = await test.tools.close.execute(
+      { sessionID: b.id, approval_id: paramsID },
+      { sessionID: a.id },
+    )
+    expect(mismatch.content).toContain("hash does not match")
+    expect(test.sessions.has(b.id)).toBe(true)
+
+    // An approval bound to a different executor cannot be consumed by another.
+    const bound = await test.tools.request_approval.execute(
+      { operation: "close", resource: b.id, parameters: {} },
+      { sessionID: a.id },
+    )
+    const boundID = approvalID(bound.content)
+    await test.tools.approve.execute(
+      { approval_id: boundID, executor: "ses_someone_else" },
+      { sessionID: "ses_root" },
+    )
+    const wrongExecutor = await test.tools.consume_approval.execute(
+      { approval_id: boundID },
+      { sessionID: a.id },
+    )
+    expect(wrongExecutor.content).toContain("bound to executor")
+
+    const rightExecutor = await test.tools.consume_approval.execute(
+      { approval_id: boundID },
+      { sessionID: "ses_someone_else" },
+    )
+    expect(rightExecutor.content).toContain("consumed")
+  })
+
+  it("rejects an approval whose resource no longer matches", async () => {
+    const { test, a, b } = await setupChain()
+    const requested = await test.tools.request_approval.execute(
+      { operation: "close", resource: b.id, parameters: {} },
+      { sessionID: a.id },
+    )
+    const id = approvalID(requested.content)
+
+    // A tampered hash must never authorize the action.
+    const record = test.storage.get(`approval/${id}`) as any
+    record.resourceHash = "0".repeat(64)
+    test.storage.set(`approval/${id}`, record)
+
+    await test.tools.approve.execute({ approval_id: id }, { sessionID: "ses_root" })
+    const closed = await test.tools.close.execute(
+      { sessionID: b.id, approval_id: id },
+      { sessionID: a.id },
+    )
+    expect(closed.content).toContain("hash does not match")
+    expect(test.sessions.has(b.id)).toBe(true)
+  })
+
   it("lets a root session approve its own request when it has no parent", async () => {
     const test = await boot()
     test.addSession("ses_root", "Root")
