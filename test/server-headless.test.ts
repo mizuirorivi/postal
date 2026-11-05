@@ -88,6 +88,15 @@ function harness() {
       remove: async (key: string) => {
         storage.delete(key)
       },
+      scan: async ({ prefix, after, limit }: { prefix: string; after?: string; limit?: number }) => {
+        const keys = [...storage.keys()].filter((key) => key.startsWith(prefix)).sort()
+        const start = after ? keys.indexOf(after) + 1 : 0
+        const slice = keys.slice(start, start + (limit ?? 200))
+        return {
+          entries: slice.map((key) => ({ key, value: storage.get(key) })),
+          ...(start + slice.length < keys.length ? { next: slice.at(-1) } : {}),
+        }
+      },
     },
     tool: {
       transform: async (callback: (editor: any) => void) => {
@@ -1899,5 +1908,31 @@ describe("v2 supervision and consultation", () => {
       { sessionID: b.id },
     )
     expect(escalation.content).toContain("only the spawn parent")
+  })
+})
+
+describe("postal_tree", () => {
+  it("renders spawned hierarchy, spawn facts, and grants", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+    await test.tools.spawn.execute({ title: "C" }, { sessionID: b.id })
+    const c = [...test.sessions.values()].find((session) => session.title === "C")!
+
+    const tree = await test.tools.tree.execute({}, { sessionID: "ses_a" })
+    expect(tree.content).toContain("SPAWNED_BY\t-")
+    expect(tree.content).toContain("ses_a (A)")
+    expect(tree.content).toContain(b.id)
+    expect(tree.content).toContain(c.id)
+    expect(tree.content).toContain("→")
+
+    const all = await test.tools.tree.execute({ all: true }, { sessionID: "ses_a" })
+    expect(all.content).toContain(b.id)
+    expect(all.content).toContain(c.id)
+
+    const rpc = await test.rpc.tree({ sessionID: "ses_a" })
+    expect(rpc.ok).toBe(true)
+    expect(rpc.tree).toContain(b.id)
   })
 })

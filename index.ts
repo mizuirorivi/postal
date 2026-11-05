@@ -42,6 +42,7 @@ import {
   type Lock,
   type Operation,
 } from "./grants.js"
+import { renderSessionTree } from "./tree.js"
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto"
 import { readFileSync, realpathSync, statSync } from "node:fs"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
@@ -89,7 +90,15 @@ type PostalContext = {
   options?: Record<string, unknown>
   session: {
     hook(name: "prompt", callback: (event: PromptEvent) => void | Promise<void>): Promise<unknown>
-    list(input?: Record<string, unknown>): Promise<{ data: Array<{ id: string; title?: string }> }>
+    list(input?: Record<string, unknown>): Promise<{
+      data: Array<{
+        id: string
+        title?: string
+        parentID?: string
+        location?: { directory?: string }
+      }>
+      cursor?: { next?: string }
+    }>
     get(input: { sessionID: string }): Promise<{ id: string; title?: string }>
     create?(input: {
       title?: string
@@ -113,6 +122,11 @@ type PostalContext = {
     get(key: string): Promise<unknown>
     set(key: string, value: unknown): Promise<void>
     remove(key: string): Promise<void>
+    scan?(input: {
+      prefix: string
+      after?: string
+      limit?: number
+    }): Promise<{ entries: Array<{ key: string; value: unknown }>; next?: string }>
   }
   tool: { transform(callback: (editor: ToolEditor) => void): Promise<unknown> }
   skill?: {
@@ -927,6 +941,18 @@ function stateLock(ctx: PostalContext): Lock {
   return (key, task) => crossProcessLock(ctx, key, task)
 }
 
+async function treeGrantAnnotations(ctx: PostalContext): Promise<Record<string, string>> {
+  const annotations: Record<string, string> = {}
+  for (const grant of await listGrants(ctx)) {
+    const allowed = allowedOperations(grant)
+    if (allowed.length === 0) continue
+    const label = `[${allowed.join(",")}]`
+    annotations[grant.from] = `${annotations[grant.from] ?? ""} →${grant.to}${label}`.trim()
+    annotations[grant.to] = `${annotations[grant.to] ?? ""} ←${grant.from}${label}`.trim()
+  }
+  return annotations
+}
+
 async function readOutboxIndex(ctx: PostalContext): Promise<string[]> {
   const value = await ctx.storage.get(OUTBOX_INDEX)
   if (!Array.isArray(value)) return []
@@ -1623,6 +1649,22 @@ async function setup(ctx: PostalContext): Promise<void> {
       disconnect: async (input) =>
         disconnect(ctx, String(input.sessionID), typeof input.peerID === "string" ? input.peerID : undefined),
       status: async (input) => peerStatus(ctx, String(input.sessionID)),
+      tree: async (input) => {
+        const sessionID = String(input.sessionID)
+        const root = typeof input.root === "string" ? input.root : undefined
+        const rawDepth = Number(input.depth)
+        const depth = Number.isFinite(rawDepth) ? Math.max(1, Math.floor(rawDepth)) : undefined
+        const annotations = await treeGrantAnnotations(ctx)
+        const tree = await renderSessionTree(ctx, {
+          callerID: sessionID,
+          root,
+          depth,
+          all: input.all === true,
+          annotations,
+        })
+        const spawn = await readSpawnFact(ctx, sessionID)
+        return { ok: true, tree: `SPAWNED_BY\t${spawn?.spawnedBy ?? "-"}\n${tree}` }
+      },
       presence: async (input) => {
         const sessions = Array.isArray(input.sessions) ? input.sessions : []
         const now = Date.now()
@@ -1725,6 +1767,35 @@ async function setup(ctx: PostalContext): Promise<void> {
         const status = await peerStatus(ctx, context.sessionID)
         const rows = (status.peers ?? []).map((peer) => `${peer.id}\t${peer.title || "(untitled)"}`)
         return { content: ["PEER_ID\tTITLE", ...rows].join("\n") }
+      },
+    })
+
+    editor.add({
+      name: "tree",
+      description:
+        "Show the session parent/child/ancestor tree. Defaults to the caller's root; use all for every root.",
+      input: {
+        type: "object",
+        properties: {
+          root: { type: "string", description: "Session ID to render as the root" },
+          depth: { type: "number", description: "Maximum tree depth (default 32)" },
+          all: { type: "boolean", description: "Show every root in this server" },
+        },
+        additionalProperties: false,
+      },
+      execute: async (input, context) => {
+        const value = input as { root?: string; depth?: number; all?: boolean }
+        const depth = Number.isFinite(value.depth) ? Math.max(1, Math.floor(value.depth as number)) : undefined
+        const annotations = await treeGrantAnnotations(ctx)
+        const tree = await renderSessionTree(ctx, {
+          callerID: context.sessionID,
+          root: value.root?.trim() || undefined,
+          depth,
+          all: value.all === true,
+          annotations,
+        })
+        const spawn = await readSpawnFact(ctx, context.sessionID)
+        return { content: `SPAWNED_BY\t${spawn?.spawnedBy ?? "-"}\n${tree}` }
       },
     })
 

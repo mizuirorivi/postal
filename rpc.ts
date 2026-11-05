@@ -12,6 +12,7 @@ const result = {
     ok: { type: "boolean" },
     peerID: { type: "string" },
     title: { type: "string" },
+    tree: { type: "string" },
     peers: {
       type: "array",
       items: {
@@ -63,6 +64,20 @@ export const PostalRpc = {
         type: "object",
         properties: {
           sessionID: { type: "string" },
+        },
+        required: ["sessionID"],
+        additionalProperties: false,
+      },
+      output: result,
+    },
+    tree: {
+      input: {
+        type: "object",
+        properties: {
+          sessionID: { type: "string" },
+          root: { type: "string" },
+          depth: { type: "number" },
+          all: { type: "boolean" },
         },
         required: ["sessionID"],
         additionalProperties: false,

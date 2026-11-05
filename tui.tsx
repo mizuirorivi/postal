@@ -525,6 +525,25 @@ async function showPeers(context: TuiContext): Promise<void> {
   ))
 }
 
+async function showTree(context: TuiContext): Promise<void> {
+  const sessionID = await resolveSession(context, "Postal: Select session for tree")
+  if (!sessionID) return
+  try {
+    const rpc = context.client.rpc?.(PostalRpc)
+    const result = await rpc?.tree({ sessionID })
+    if (!result || result.ok === false || !result.tree) {
+      await context.ui.dialog.alert({
+        title: "Postal",
+        message: result?.error ?? "Session tree is unavailable.",
+      })
+      return
+    }
+    await context.ui.dialog.alert({ title: "Postal: Session tree", message: result.tree })
+  } catch (error) {
+    await context.ui.dialog.alert({ title: "Postal", message: `Session tree failed: ${String(error)}` })
+  }
+}
+
 const plugin = {
   id: "postal.tui",
   setup(context: TuiContext) {
