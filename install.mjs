@@ -59,6 +59,8 @@ const files = [
   "lock.ts",
   "state.ts",
   "grants.ts",
+  "approvals.ts",
+  "audit.ts",
   "tree.ts",
   "tasks.ts",
   "forms.ts",
