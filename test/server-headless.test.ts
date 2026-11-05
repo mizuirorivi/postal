@@ -1430,3 +1430,37 @@ describe("retry availability", () => {
     }
   })
 })
+
+describe("mention addressing", () => {
+  it("forwards only when the prompt starts with an address", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+
+    await test.hooks.prompt({
+      sessionID: "ses_a",
+      prompt: { text: "Example @ses_b should not forward" },
+      metadata: {},
+    })
+    await flush()
+    expect(test.prompts).toHaveLength(0)
+
+    await test.hooks.prompt({
+      sessionID: "ses_a",
+      prompt: { text: "```\n@ses_b should not forward\n```" },
+      metadata: {},
+    })
+    await flush()
+    expect(test.prompts).toHaveLength(0)
+
+    await test.hooks.prompt({
+      sessionID: "ses_a",
+      prompt: { text: "  @ses_b hello" },
+      metadata: {},
+    })
+    await flush()
+    expect(test.prompts).toHaveLength(1)
+    expect(test.prompts[0].sessionID).toBe("ses_b")
+  })
+})

@@ -173,6 +173,7 @@ type OutboxRecord = {
 }
 
 const MENTION = /@(ses_[A-Za-z0-9_-]+)/g
+const ADDRESS = /^\s*@(ses_[A-Za-z0-9_-]+)/
 
 function errorText(error: unknown): string {
   if (error instanceof Error) return error.message
@@ -2361,9 +2362,9 @@ async function setup(ctx: PostalContext): Promise<void> {
       return
     }
     const text = event.prompt?.text ?? ""
-    MENTION.lastIndex = 0
-    const match = MENTION.exec(text)
-    MENTION.lastIndex = 0
+    // Only a prompt that starts with an address is forwarded. Mentions in
+    // prose, examples, or code fences must not send the prompt anywhere.
+    const match = ADDRESS.exec(text)
     if (!match) return
     const to = match[1]
     const from = event.sessionID

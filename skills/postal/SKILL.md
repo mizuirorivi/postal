@@ -132,7 +132,9 @@ Tradeoffs:
 
 ## Human mention mode
 
-- A human can send `@ses_XXXX <message>` in a normal prompt.
+- A human can send `@ses_XXXX <message>` at the start of a normal prompt.
+- Only an address in the first token is forwarded. Mentions in prose, examples,
+  or code fences are ordinary text and are not sent anywhere.
 - The plugin forwards it immediately and returns. There is no blocking wait and
   no queued reply; the receiver answers with `postal_send`, which starts the
   sender's next turn.
