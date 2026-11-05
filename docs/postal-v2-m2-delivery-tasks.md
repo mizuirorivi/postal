@@ -21,7 +21,7 @@
 | --- | --- | --- |
 | `interrupt` | Wake the target immediately (current behavior, human default) | `steer` |
 | `idle` | Steer only when the target's presence is `idle`; otherwise queue | `steer` / `queue` |
-| `inbox` | Never wake; admit on the target's next turn | `queue` |
+| `inbox` | Never wake; admit on the target's next turn | `queue` + `resume: false` |
 
 - The policy is stored on the directed relation grant (`grant.delivery`).
 - Default for new relations: `interrupt` (human decision).
@@ -32,22 +32,31 @@
 
 ### Runtime mapping
 
-`postOnly` gains a `delivery?: "steer" | "queue"` option. Before prompting:
+`postOnly` gains `delivery?: "steer" | "queue"` and `resume?: boolean`.
+Before prompting:
 
 ```ts
 const mode = grant.delivery ?? "interrupt"
-const delivery =
-  mode === "inbox" ? "queue" :
-  mode === "idle" ? (await readPresence(ctx, to))?.state === "idle" ? "steer" : "queue" :
-  "steer"
+const route =
+  mode === "inbox" ? { delivery: "queue", resume: false } :
+  mode === "idle"
+    ? (await readPresence(ctx, to))?.state === "idle"
+      ? { delivery: "steer" }
+      : { delivery: "queue", resume: false }
+    : { delivery: "steer" }
 ```
 
-- `attemptOutbox`, `postal_send`, `broadcast`, and watchdog use the resolver.
-- `queue` is the host's non-waking inbox admission, not a separate postal
-  mailbox. If the host exposes a receive-inbox API, M2 can add a receiver view;
-  otherwise `queue` is the supported contract.
+- Spike result (OpenCode 2.2.5): `delivery: "queue"` with `resume: false`
+  creates an inbox item, does not start a turn, and drains when a later steer
+  prompt runs. This is the non-waking inbox contract.
+- `interrupt` uses `steer`; `idle` uses `steer` only when presence is `idle`;
+  `inbox` always uses `queue` + `resume: false`.
+- System notices (watchdog, reparent) always use `interrupt` so control mail is
+  not delayed.
 - Idle uses TUI presence (30s TTL). Headless targets are `unknown`; `idle` mode
   queues them until they become visible.
+- A separate receiver-inbox UI is out of scope; the host inbox holds queued
+  messages and `postal_inbox` remains the sender outbox plus presence.
 
 ## 3. Message state vs task state (F-06)
 

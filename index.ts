@@ -13,7 +13,8 @@
  *    again, so two AIs can hold a rally. `postal_send` without `to` uses the
  *    peer connected via the Ctrl+P command.
  *
- * All deliveries use `steer`; Postal never queues replies or notices.
+ * Delivery defaults to `steer`; the relation policy may hold mail with
+ * `delivery: "queue"` + `resume: false` for inbox/idle modes.
  *
  * Loop safety: every prompt this plugin sends carries
  * `metadata.postal.relay = true` and the prompt hook ignores those. Assistant
@@ -37,8 +38,10 @@ import {
   OPERATIONS,
   readSpawnFact,
   revokeOperations,
+  setDelivery,
   wouldCreateParentCycle,
   writeSpawnFact,
+  type DeliveryMode,
   type Lock,
   type Operation,
 } from "./grants.js"
@@ -759,6 +762,8 @@ async function postOnly(
     rally: number
     max: number
     envelope?: Partial<Envelope>
+    delivery?: "steer" | "queue"
+    resume?: boolean
   },
 ): Promise<Envelope> {
   const envelope: Envelope = {
@@ -813,11 +818,34 @@ async function postOnly(
     }
   }
 
+  let delivery = options.delivery
+  let resume = options.resume
+  if (!delivery) {
+    const mode: DeliveryMode =
+      envelope.kind === "system"
+        ? "interrupt"
+        : (await ensureGrant(ctx, stateLock(ctx), options.from, options.to))?.delivery ?? "interrupt"
+    if (mode === "inbox") {
+      delivery = "queue"
+      resume = false
+    } else if (mode === "idle") {
+      const presence = await readPresence(ctx, options.to)
+      if (presence?.state === "idle") {
+        delivery = "steer"
+      } else {
+        delivery = "queue"
+        resume = false
+      }
+    } else {
+      delivery = "steer"
+    }
+  }
   const signed = await signLetter(ctx, options.from, options.to, letter, envelope)
   await ctx.session.prompt({
     sessionID: options.to,
     text: letter,
-    delivery: "steer",
+    delivery: delivery ?? "steer",
+    ...(resume === false ? { resume: false } : {}),
     metadata: {
       postal: {
         relay: true,
@@ -1918,6 +1946,34 @@ async function setup(ctx: PostalContext): Promise<void> {
     })
 
     editor.add({
+      name: "delivery",
+      description: "Set the caller's delivery mode toward 'to': interrupt, idle, or inbox.",
+      input: {
+        type: "object",
+        properties: {
+          to: { type: "string" },
+          mode: { type: "string", enum: ["interrupt", "idle", "inbox"] },
+        },
+        required: ["to", "mode"],
+        additionalProperties: false,
+      },
+      execute: async (input, context) => {
+        const value = input as { to?: string; mode?: string }
+        const to = value.to?.trim()
+        if (!to) return { content: "postal: 'to' is required" }
+        if (value.mode !== "interrupt" && value.mode !== "idle" && value.mode !== "inbox") {
+          return { content: "postal: mode must be interrupt, idle, or inbox" }
+        }
+        try {
+          const grant = await setDelivery(ctx, stateLock(ctx), context.sessionID, to, value.mode)
+          return { content: `DELIVERY\t${to}\t${grant.delivery}` }
+        } catch (error) {
+          return { content: `postal: delivery failed: ${errorText(error)}` }
+        }
+      },
+    })
+
+    editor.add({
       name: "revoke",
       description: "Revoke operations from a relation. Omit operations to revoke all of them.",
       input: {
@@ -1983,6 +2039,7 @@ async function setup(ctx: PostalContext): Promise<void> {
             enforceable || "-",
             approval.join(",") || "-",
             expires,
+            grant.delivery,
             grant.revokedAt ? "revoked" : "active",
           ].join("\t")
         })
@@ -1990,7 +2047,7 @@ async function setup(ctx: PostalContext): Promise<void> {
           content: [
             `SESSION_ID\t${target}`,
             `SPAWNED_BY\t${spawn?.spawnedBy ?? "-"}`,
-            "DIRECTION\tPEER\tOPERATIONS\tENFORCEABLE\tAPPROVAL_REQUIRED\tEXPIRES\tSTATE",
+            "DIRECTION\tPEER\tOPERATIONS\tENFORCEABLE\tAPPROVAL_REQUIRED\tEXPIRES\tDELIVERY\tSTATE",
             ...(rows.length > 0 ? rows : ["(no grants)"]),
           ].join("\n"),
         }

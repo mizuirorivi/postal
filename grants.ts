@@ -35,10 +35,13 @@ export type GrantRule = {
   constraints?: Record<string, unknown>
 }
 
+export type DeliveryMode = "interrupt" | "idle" | "inbox"
+
 export type RelationGrant = {
   from: string
   to: string
   operations: Record<Operation, GrantRule>
+  delivery: DeliveryMode
   initialized: true
   createdAt: number
   updatedAt: number
@@ -236,6 +239,7 @@ export async function ensureGrant(
       from,
       to,
       operations: defaults,
+      delivery: "interrupt",
       initialized: true,
       createdAt: now,
       updatedAt: now,
@@ -277,6 +281,7 @@ export async function grantOperations(
       from,
       to,
       operations: next,
+      delivery: existing?.delivery ?? "interrupt",
       initialized: true,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
@@ -311,6 +316,23 @@ export async function revokeOperations(
     }
     existing.updatedAt = now
     existing.revokedAt = now
+    await ctx.storage.set(grantKey(from, to), existing)
+    return existing
+  })
+}
+
+export async function setDelivery(
+  ctx: GrantContext,
+  lock: Lock,
+  from: string,
+  to: string,
+  mode: DeliveryMode,
+): Promise<RelationGrant> {
+  return lock(grantKey(from, to), async () => {
+    const existing = await readGrant(ctx, from, to)
+    if (!existing) throw new GrantError(`${from} has no relation with ${to}`)
+    existing.delivery = mode
+    existing.updatedAt = Date.now()
     await ctx.storage.set(grantKey(from, to), existing)
     return existing
   })
@@ -377,6 +399,8 @@ function normalizeGrant(record: Partial<RelationGrant>, from: string, to: string
     from,
     to,
     operations,
+    delivery:
+      record.delivery === "inbox" || record.delivery === "idle" ? record.delivery : "interrupt",
     initialized: true,
     createdAt: typeof record.createdAt === "number" ? record.createdAt : 0,
     updatedAt: typeof record.updatedAt === "number" ? record.updatedAt : 0,

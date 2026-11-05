@@ -1936,3 +1936,43 @@ describe("postal_tree", () => {
     expect(rpc.tree).toContain(b.id)
   })
 })
+
+describe("v2 delivery policy", () => {
+  it("routes interrupt, idle, and inbox correctly", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+
+    await test.tools.send.execute({ to: "ses_b", text: "default", msg_id: "msg_delivery_default" }, { sessionID: "ses_a" })
+    expect(test.prompts.at(-1)?.delivery).toBe("steer")
+    expect(test.prompts.at(-1)?.resume).toBeUndefined()
+
+    await test.tools.delivery.execute({ to: "ses_b", mode: "inbox" }, { sessionID: "ses_a" })
+    await test.tools.send.execute({ to: "ses_b", text: "inbox", msg_id: "msg_delivery_inbox" }, { sessionID: "ses_a" })
+    expect(test.prompts.at(-1)?.delivery).toBe("queue")
+    expect(test.prompts.at(-1)?.resume).toBe(false)
+
+    await test.tools.delivery.execute({ to: "ses_b", mode: "idle" }, { sessionID: "ses_a" })
+    await test.rpc.presence({ sessions: [{ id: "ses_b", title: "B", state: "idle", pending: [] }] })
+    await test.tools.send.execute({ to: "ses_b", text: "idle", msg_id: "msg_delivery_idle" }, { sessionID: "ses_a" })
+    expect(test.prompts.at(-1)?.delivery).toBe("steer")
+
+    await test.rpc.presence({ sessions: [{ id: "ses_b", title: "B", state: "running", pending: [] }] })
+    await test.tools.send.execute({ to: "ses_b", text: "busy", msg_id: "msg_delivery_busy" }, { sessionID: "ses_a" })
+    expect(test.prompts.at(-1)?.delivery).toBe("queue")
+    expect(test.prompts.at(-1)?.resume).toBe(false)
+
+    const relations = await test.tools.relations.execute({}, { sessionID: "ses_a" })
+    expect(relations.content).toContain("DELIVERY")
+    expect(relations.content).toContain("idle")
+  })
+
+  it("rejects a delivery mode for an unrelated session", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    const result = await test.tools.delivery.execute({ to: "ses_b", mode: "inbox" }, { sessionID: "ses_a" })
+    expect(result.content).toContain("delivery failed")
+  })
+})
