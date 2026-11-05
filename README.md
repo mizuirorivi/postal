@@ -27,7 +27,7 @@ its own model, agent, permissions, and tab.
 - `postal_directory`, `postal_peers`, and `postal_spawn` tools for address discovery and worker creation
 - Structured envelopes (`kind`, `task_id`, `reply_to`, artifacts, commands, `msg_id`)
 - HMAC Phase 1: per-pair keys, signed envelopes, ±120s window, 24h key grace, task grants
-- `postal_status` (rally budget / last letter / busy-idle / inbox count) and `postal_log` (postal audit)
+- `postal_status` (rally budget / last letter / busy-idle / inbox count) and `postal_log` (mail transcript log), plus `postal_audit` (decision audit)
 - TUI presence bridge for live busy/idle and pending-inbox metadata
 - Artifact existence + sha256 verification on `verify` letters
 - Persistent outbox with retry + ACK (`postal_inbox`, `postal_resend`, `postal_retry`)

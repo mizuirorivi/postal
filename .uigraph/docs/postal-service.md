@@ -114,7 +114,7 @@ and the prompt hook ignores them, so they are not forwarded again.
   its own records, or records for a target it may inspect with `history`.
 - **Tasks.** Assignment/task letters create `task/<from>/<taskID>` state
   (`open`/`in_progress`/`blocked`/`done`/`cancelled`). ACK does not complete a
-  task; `postal_task` updates it. `request` uses `send`, `assignment` uses
+  task; `postal_task_state` updates it. `request` uses `send`, `assignment` uses
   `task`; `task` remains the legacy alias.
 - **Watchdog.** Delivered task/assignment records that remain unacked and are
   not terminal are checked against TUI presence. Idle workers receive a
