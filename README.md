@@ -22,7 +22,7 @@ its own model, agent, permissions, and tab.
 
 ## Features
 
-- `@ses_XXXX <message>` mention delivery that returns immediately
+- `@ses_XXXX <message>` at the start of a prompt (mention delivery that returns immediately)
 - `postal_send` tool for AI-to-AI letters (non-blocking)
 - `postal_directory`, `postal_peers`, and `postal_spawn` tools for address discovery and worker creation
 - Structured envelopes (`kind`, `task_id`, `reply_to`, artifacts, commands, `msg_id`)
@@ -102,11 +102,23 @@ git -C ~/.config/opencode/plugins/postal pull
 
 ### Uninstall
 
+Before removing the plugin, run `postal_disconnect` in each open session (or
+close the sessions). This clears the per-session `postal-peer` instruction
+note.
+
 ```sh
 opencode plugin remove github:mizuirorivi/postal
-# or remove the cloned directory
-rm -rf ~/.config/opencode/plugins/postal
+rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/postal"
+rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills/postal"
+# project install:
+rm -rf .opencode/plugins/postal .opencode/skills/postal
 ```
+
+The installer copies the skill to the global or project skills directory in
+addition to the plugin directory, so removing only the plugin leaves the skill
+behind. Sessions that were not disconnected may keep the `postal-peer` note in
+host session state until the session is deleted or the runtime restarts; the
+plugin has no unload/teardown hook.
 
 ### Requirements
 
@@ -117,11 +129,15 @@ rm -rf ~/.config/opencode/plugins/postal
 
 ### Human: mention a session
 
-Type a normal prompt with a session ID:
+Start a normal prompt with a session ID:
 
 ```text
 @ses_abc123 Please review the changes in src/foo.ts and reply with the risks.
 ```
+
+The address must be the first token of the prompt. An `@ses_...` that appears
+mid-sentence, in documentation, or inside a code fence is treated as ordinary
+text and is never forwarded.
 
 Postal forwards the message to `ses_abc123` immediately and returns. The
 receiving session replies with `postal_send`, which starts your next turn.
@@ -346,9 +362,11 @@ Session A ── @ses_B / postal_send ──▶ Postal ──▶ Session B
     └──────────── reply / next rally ──────────────┘
 ```
 
-- **Mention mode** runs on prompt admission. It forwards the text with `steer`
-  and returns immediately. The receiver answers with `postal_send`, which starts
-  the sender's next turn; no reply is parked in the sender's inbox.
+- **Mention mode** runs on prompt admission only when the prompt starts with an
+  `@ses_...` address. It forwards the text with `steer` and returns immediately.
+  The receiver answers with `postal_send`, which starts the sender's next turn;
+  no reply is parked in the sender's inbox. Mid-sentence, documentation, and
+  code-fence mentions are ignored.
 - **Tool mode** delivers with `steer` so an idle target starts immediately. The
   receiving AI replies with another `postal_send`.
 - **Worker creation** uses `ctx.session.create` with the requested title,
