@@ -199,9 +199,10 @@ describe("multiple postal peers", () => {
 
 describe("asynchronous delivery", () => {
   it("forwards mentions immediately without queuing a reply", async () => {
-    const { addSession, hooks, prompts } = await boot()
+    const { addSession, rpc, hooks, prompts } = await boot()
     addSession("ses_a", "A")
     addSession("ses_b", "B")
+    await rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
 
     hooks.prompt({ sessionID: "ses_a", prompt: { text: "@ses_b hello there" }, metadata: {} })
     await flush()
@@ -2146,5 +2147,28 @@ describe("v2 disconnect revocation", () => {
       { sessionID: "ses_a" },
     )
     expect(resent.content).toContain("delivered")
+  })
+})
+
+describe("v2 mention enforcement", () => {
+  it("blocks mentions after disconnect or send revocation", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.rpc.disconnect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.hooks.prompt({ sessionID: "ses_a", prompt: { text: "@ses_b hello" }, metadata: {} })
+    await flush()
+    expect(test.prompts).toHaveLength(0)
+
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.hooks.prompt({ sessionID: "ses_a", prompt: { text: "@ses_b hello" }, metadata: {} })
+    await flush()
+    expect(test.prompts).toHaveLength(1)
+
+    await test.tools.revoke.execute({ to: "ses_b", operations: ["send"] }, { sessionID: "ses_a" })
+    await test.hooks.prompt({ sessionID: "ses_a", prompt: { text: "@ses_b hello" }, metadata: {} })
+    await flush()
+    expect(test.prompts).toHaveLength(1)
   })
 })

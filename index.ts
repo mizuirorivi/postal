@@ -1554,6 +1554,18 @@ async function cleanupOutbox(
 async function relayMention(ctx: PostalContext, input: { from: string; to: string; body: string }): Promise<void> {
   const { from, to, body } = input
   if (from === to) return
+  // R-01/F-08: mention delivery goes through the same pair and send-grant
+  // checks as postal_send; disconnect and revoke both stop it.
+  const peers = await readPeers(ctx, from)
+  if (!peers.some((peer) => peer.id === to)) {
+    console.warn(`postal: mention delivery to ${to} skipped: not paired`)
+    return
+  }
+  const relation = await ensureGrant(ctx, stateLock(ctx), from, to)
+  if (!relation || !isRuleActive(relation.operations.send, "send")) {
+    console.warn(`postal: mention delivery to ${to} skipped: send not granted`)
+    return
+  }
   const max = maxRally(ctx)
   const rally = await nextRally(ctx, from, to)
   if (rally > max) {
