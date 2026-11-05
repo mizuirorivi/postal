@@ -1702,3 +1702,79 @@ describe("v2 delivery integrity", () => {
     expect(test.prompts).toHaveLength(0)
   })
 })
+
+describe("v2 same-id concurrency", () => {
+  it("serializes concurrent sends with the same msg_id", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    const [first, second] = await Promise.all([
+      test.tools.send.execute({ to: "ses_b", text: "one", msg_id: "msg_concurrent" }, { sessionID: "ses_a" }),
+      test.tools.send.execute({ to: "ses_b", text: "two", msg_id: "msg_concurrent" }, { sessionID: "ses_a" }),
+    ])
+    const contents = [first.content, second.content]
+    expect(contents.filter((content) => content.startsWith("postal: letter delivered")).length).toBe(1)
+    expect(contents.filter((content) => content.includes("duplicate")).length).toBe(1)
+    expect(test.prompts).toHaveLength(1)
+  })
+})
+
+describe("v2 replay and resend limits", () => {
+  it("rejects a replayed letter at the receiver", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.tools.send.execute({ to: "ses_b", text: "once", msg_id: "msg_replay" }, { sessionID: "ses_a" })
+    const sent = test.prompts.at(-1)!
+    const first = {
+      sessionID: "ses_b",
+      prompt: { text: sent.text },
+      metadata: structuredClone(sent.metadata),
+    }
+    await test.hooks.prompt(first)
+    expect(first.prompt.text).toBe(sent.text)
+
+    const second = {
+      sessionID: "ses_b",
+      prompt: { text: sent.text },
+      metadata: structuredClone(sent.metadata),
+    }
+    await test.hooks.prompt(second)
+    expect(second.prompt.text).toBe("")
+    expect((second.metadata as any).postal.reason).toBe("duplicate")
+  })
+
+  it("refuses resends past the limit", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.tools.send.execute({ to: "ses_b", text: "hello", msg_id: "msg_cap" }, { sessionID: "ses_a" })
+    const key = outboxKey("ses_a", "msg_cap")
+    const record = test.storage.get(key) as any
+    record.resendCount = 5
+    test.storage.set(key, record)
+    const before = test.prompts.length
+
+    const result = await test.tools.resend.execute({ msg_id: "msg_cap" }, { sessionID: "ses_a" })
+    expect(result.content).toContain("resend limit reached")
+    expect(test.prompts.length).toBe(before)
+  })
+})
+
+describe("v2 shared record serialization", () => {
+  it("keeps both peers when pairs are created concurrently", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    test.addSession("ses_c", "C")
+    await Promise.all([
+      test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" }),
+      test.rpc.connect({ sessionID: "ses_a", peerID: "ses_c" }),
+    ])
+    const status = await test.rpc.status({ sessionID: "ses_a" })
+    expect((status.peers ?? []).map((peer: any) => peer.id).sort()).toEqual(["ses_b", "ses_c"])
+  })
+})

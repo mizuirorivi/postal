@@ -173,6 +173,7 @@ type OutboxRecord = {
   queuedForWindow?: boolean
   nudges?: number
   lastNudgeAt?: number
+  resendCount?: number
 }
 
 type ReceiptRecord = {
@@ -336,6 +337,7 @@ function messageText(message: ProjectedMessage): string {
 }
 
 const PRESENCE_TTL_MS = 30_000
+const SEEN_TTL_MS = 24 * 60 * 60 * 1000
 
 /** Direct parent recorded when this session was spawned by another session. */
 async function readParent(ctx: PostalContext, sessionID: string): Promise<ParentRecord | undefined> {
@@ -352,29 +354,33 @@ async function readChildren(ctx: PostalContext, sessionID: string): Promise<stri
 
 async function writeParent(ctx: PostalContext, childID: string, parentID: string): Promise<void> {
   if (childID === parentID) return
-  const previous = await readParent(ctx, childID)
-  if (previous?.parentID && previous.parentID !== parentID) {
+  await crossProcessLock(ctx, "parent-tree", async () => {
+    const previous = await readParent(ctx, childID)
+    if (previous?.parentID && previous.parentID !== parentID) {
+      const siblings = await readChildren(ctx, previous.parentID)
+      const next = siblings.filter((id) => id !== childID)
+      if (next.length === 0) await ctx.storage.remove(`children/${previous.parentID}`)
+      else await ctx.storage.set(`children/${previous.parentID}`, next)
+    }
+    await ctx.storage.set(`parent/${childID}`, { parentID, createdAt: Date.now() } satisfies ParentRecord)
+    const children = await readChildren(ctx, parentID)
+    if (!children.includes(childID)) {
+      children.push(childID)
+      await ctx.storage.set(`children/${parentID}`, children)
+    }
+  })
+}
+
+async function removeParent(ctx: PostalContext, childID: string): Promise<void> {
+  await crossProcessLock(ctx, "parent-tree", async () => {
+    const previous = await readParent(ctx, childID)
+    if (!previous) return
+    await ctx.storage.remove(`parent/${childID}`)
     const siblings = await readChildren(ctx, previous.parentID)
     const next = siblings.filter((id) => id !== childID)
     if (next.length === 0) await ctx.storage.remove(`children/${previous.parentID}`)
     else await ctx.storage.set(`children/${previous.parentID}`, next)
-  }
-  await ctx.storage.set(`parent/${childID}`, { parentID, createdAt: Date.now() } satisfies ParentRecord)
-  const children = await readChildren(ctx, parentID)
-  if (!children.includes(childID)) {
-    children.push(childID)
-    await ctx.storage.set(`children/${parentID}`, children)
-  }
-}
-
-async function removeParent(ctx: PostalContext, childID: string): Promise<void> {
-  const previous = await readParent(ctx, childID)
-  if (!previous) return
-  await ctx.storage.remove(`parent/${childID}`)
-  const siblings = await readChildren(ctx, previous.parentID)
-  const next = siblings.filter((id) => id !== childID)
-  if (next.length === 0) await ctx.storage.remove(`children/${previous.parentID}`)
-  else await ctx.storage.set(`children/${previous.parentID}`, next)
+  })
 }
 
 /** A session may inspect itself, or a session it can command as parent/ancestor. */
@@ -526,13 +532,15 @@ async function readHmacRecord(ctx: PostalContext, a: string, b: string): Promise
 
 /** Create the pair key once; pairing itself also calls this. */
 async function ensureHmacRecord(ctx: PostalContext, a: string, b: string): Promise<HmacRecord> {
-  return serialized(hmacLocks, hmacStorageKey(a, b), async () => {
-    const existing = await readHmacRecord(ctx, a, b)
-    if (existing) return existing
-    const record: HmacRecord = { current: newHmacKey(), previous: [] }
-    await ctx.storage.set(hmacStorageKey(a, b), record)
-    return record
-  })
+  return crossProcessLock(ctx, hmacStorageKey(a, b), () =>
+    serialized(hmacLocks, hmacStorageKey(a, b), async () => {
+      const existing = await readHmacRecord(ctx, a, b)
+      if (existing) return existing
+      const record: HmacRecord = { current: newHmacKey(), previous: [] }
+      await ctx.storage.set(hmacStorageKey(a, b), record)
+      return record
+    }),
+  )
 }
 
 const HMAC_VERSION = 2
@@ -668,6 +676,11 @@ function outboxTtlMs(ctx: PostalContext): number {
   const configured = Number(ctx.options?.outboxTtlDays)
   const days = Number.isFinite(configured) && configured > 0 ? configured : 7
   return Math.max(1, Math.min(90, days)) * 24 * 60 * 60 * 1000
+}
+
+function maxResends(ctx: PostalContext): number {
+  const configured = Number(ctx.options?.maxResends)
+  return Number.isFinite(configured) && configured >= 0 ? Math.min(20, Math.floor(configured)) : 5
 }
 
 /** Return the ancestor that authorizes `actor` to task `target`, if any. */
@@ -1301,6 +1314,27 @@ async function runWatchdog(
   return { candidates, nudged }
 }
 
+/** Remove expired receiver dedupe markers. */
+async function cleanupSeen(ctx: PostalContext): Promise<void> {
+  if (typeof ctx.storage.scan !== "function") return
+  let after: string | undefined
+  for (let page = 0; page < 20; page += 1) {
+    const result = await ctx.storage.scan({
+      prefix: "seen/",
+      limit: 200,
+      ...(after ? { after } : {}),
+    })
+    for (const entry of result.entries ?? []) {
+      const value = entry.value
+      if (typeof value !== "number" || Date.now() - value > SEEN_TTL_MS) {
+        await ctx.storage.remove(entry.key)
+      }
+    }
+    after = result.next
+    if (!after) break
+  }
+}
+
 /** Remove old delivered/acked/failed outbox records; msg markers stay for idempotency. */
 async function cleanupOutbox(
   ctx: PostalContext,
@@ -1452,22 +1486,24 @@ async function refreshNote(ctx: PostalContext, sessionID: string): Promise<void>
 /** Pair two sessions; both sides keep every peer they have connected. */
 async function pair(ctx: PostalContext, from: string, peerID: string): Promise<PairResult> {
   if (!peerID || peerID === from) return { ok: false, error: "invalid peer" }
-  return serialized(peerLocks, pairLockKey(from, peerID), async () => {
-    try {
-      const [self, peer] = await Promise.all([
-        ctx.session.get({ sessionID: from }),
-        ctx.session.get({ sessionID: peerID }),
-      ])
-      await addPeer(ctx, from, { id: peerID, title: peer.title ?? "" })
-      await addPeer(ctx, peerID, { id: from, title: self.title ?? "" })
-      await ensureHmacRecord(ctx, from, peerID)
-      await Promise.all([refreshNote(ctx, from), refreshNote(ctx, peerID)])
-      return { ok: true, peerID, title: peer.title ?? "" }
-    } catch (error) {
-      console.warn(`postal: pairing ${from} <-> ${peerID} failed: ${errorText(error)}`)
-      return { ok: false, error: errorText(error) }
-    }
-  })
+  return crossProcessLock(ctx, "peers", () =>
+    serialized(peerLocks, pairLockKey(from, peerID), async () => {
+      try {
+        const [self, peer] = await Promise.all([
+          ctx.session.get({ sessionID: from }),
+          ctx.session.get({ sessionID: peerID }),
+        ])
+        await addPeer(ctx, from, { id: peerID, title: peer.title ?? "" })
+        await addPeer(ctx, peerID, { id: from, title: self.title ?? "" })
+        await ensureHmacRecord(ctx, from, peerID)
+        await Promise.all([refreshNote(ctx, from), refreshNote(ctx, peerID)])
+        return { ok: true, peerID, title: peer.title ?? "" }
+      } catch (error) {
+        console.warn(`postal: pairing ${from} <-> ${peerID} failed: ${errorText(error)}`)
+        return { ok: false, error: errorText(error) }
+      }
+    }),
+  )
 }
 
 /** Read all peers for a session, dropping records whose session is gone. */
@@ -1501,6 +1537,10 @@ async function peerStatus(ctx: PostalContext, sessionID: string): Promise<PairRe
 
 /** Disconnect one peer, or every peer when peerID is omitted. */
 async function disconnect(ctx: PostalContext, sessionID: string, peerID?: string): Promise<PairResult> {
+  return crossProcessLock(ctx, "peers", () => disconnectLocked(ctx, sessionID, peerID))
+}
+
+async function disconnectLocked(ctx: PostalContext, sessionID: string, peerID?: string): Promise<PairResult> {
   try {
     const peers = await readPeers(ctx, sessionID)
     const targets = peerID ? peers.filter((peer) => peer.id === peerID) : peers
@@ -2164,21 +2204,31 @@ async function setup(ctx: PostalContext): Promise<void> {
       execute: async (input, context) => {
         const msgID = String((input as { msg_id?: unknown }).msg_id ?? "")
         if (!msgID) return { content: "postal: 'msg_id' is required" }
-        const record = await getOutbox(ctx, msgID, context.sessionID)
-        if (!record) return { content: `postal: outbox entry not found: ${msgID}` }
-        if (record.from !== context.sessionID) {
-          return { content: "postal: cannot resend another session's letter" }
-        }
-        await crossProcessLock(ctx, outboxKey(record.from, record.msgID), async () => {
-          await removeReceipt(ctx, record.from, record.to, record.msgID)
-          record.status = "pending"
-          record.attempts = 0
-          record.nextAt = 0
-          record.lastError = undefined
-          record.queuedForWindow = false
-          await updateOutbox(ctx, record)
+        const prepared = await crossProcessLock(ctx, outboxKey(context.sessionID, msgID), async () => {
+          const current = await getOutbox(ctx, msgID, context.sessionID)
+          if (!current) return { ok: false as const, content: `postal: outbox entry not found: ${msgID}` }
+          if (current.from !== context.sessionID) {
+            return { ok: false as const, content: "postal: cannot resend another session's letter" }
+          }
+          const limit = maxResends(ctx)
+          if ((current.resendCount ?? 0) >= limit) {
+            return {
+              ok: false as const,
+              content: `postal: resend limit reached (${limit}) for ${msgID}; send a new msg_id.`,
+            }
+          }
+          await removeReceipt(ctx, current.from, current.to, current.msgID)
+          current.status = "pending"
+          current.attempts = 0
+          current.nextAt = 0
+          current.lastError = undefined
+          current.queuedForWindow = false
+          current.resendCount = (current.resendCount ?? 0) + 1
+          await updateOutbox(ctx, current)
+          return { ok: true as const, record: current }
         })
-        const result = await attemptOutbox(ctx, record)
+        if (!prepared.ok) return { content: prepared.content }
+        const result = await attemptOutbox(ctx, prepared.record)
         if (result.status === "delivered") return { content: `postal: resent ${msgID}` }
         if (result.status === "failed") {
           return { content: `postal: resend failed: ${result.lastError ?? "unknown error"}` }
@@ -2296,8 +2346,9 @@ async function setup(ctx: PostalContext): Promise<void> {
           return { content: `postal: peer not paired: ${peerID}` }
         }
         const key = hmacStorageKey(context.sessionID, peerID)
-        const result = await serialized(hmacLocks, key, async () => {
-          const existing = await readHmacRecord(ctx, context.sessionID, peerID)
+        const result = await crossProcessLock(ctx, key, () =>
+          serialized(hmacLocks, key, async () => {
+            const existing = await readHmacRecord(ctx, context.sessionID, peerID)
           if (!existing) {
             const current = newHmacKey()
             await ctx.storage.set(key, { current, previous: [] } satisfies HmacRecord)
@@ -2310,9 +2361,10 @@ async function setup(ctx: PostalContext): Promise<void> {
             ...existing.previous.filter((old) => !old.validUntil || old.validUntil > now),
           ]
           const current = newHmacKey()
-          await ctx.storage.set(key, { current, previous } satisfies HmacRecord)
-          return { keyID: current.keyID, oldKeyID: existing.current.keyID, graceUntil }
-        })
+            await ctx.storage.set(key, { current, previous } satisfies HmacRecord)
+            return { keyID: current.keyID, oldKeyID: existing.current.keyID, graceUntil }
+          }),
+        )
         return {
           content:
             `postal: rekeyed ${peerID}; new keyID ${result.keyID}` +
@@ -2483,6 +2535,7 @@ async function setup(ctx: PostalContext): Promise<void> {
         lastOutboxCleanupAt.set(timerKey, Date.now())
         // Background cleanup is not a dry run; the tool keeps the dry-run default.
         void cleanupOutbox(ctx, { dryRun: false })
+        void cleanupSeen(ctx)
       }
     }, RETRY_INTERVAL_MS)
     timer.unref?.()
@@ -2575,6 +2628,22 @@ async function setup(ctx: PostalContext): Promise<void> {
           return
         }
         meta.postal.authorizedBy = authorizedBy
+      }
+      // R-03: reject a replay of an already admitted msgID. The seen marker is
+      // written only after signature and task authorization succeed.
+      if (msgID) {
+        const seenKey = `seen/${encodeURIComponent(from)}/${encodeURIComponent(event.sessionID)}/${encodeURIComponent(msgID)}`
+        const duplicate = await crossProcessLock(ctx, seenKey, async () => {
+          const previous = await ctx.storage.get(seenKey)
+          if (typeof previous === "number" && Date.now() - previous < SEEN_TTL_MS) return true
+          await ctx.storage.set(seenKey, Date.now())
+          return false
+        })
+        if (duplicate) {
+          event.prompt.text = ""
+          meta.postal.reason = "duplicate"
+          return
+        }
       }
       if (receiptBase) {
         await putReceipt(ctx, {
