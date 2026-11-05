@@ -2065,6 +2065,33 @@ describe("v2 approvals", () => {
     expect(test.sessions.has(b.id)).toBe(true)
   })
 
+  it("audits grant, delivery, task, and revoke decisions", async () => {
+    const { test, a, b } = await setupChain()
+
+    await test.tools.grant.execute(
+      { to: b.id, operations: ["history"], approvalRequired: false },
+      { sessionID: a.id },
+    )
+    await test.tools.delivery.execute({ to: b.id, mode: "inbox" }, { sessionID: a.id })
+    await test.tools.send.execute(
+      { to: b.id, text: "assignment", kind: "assignment", task_id: "T-audit", msg_id: "msg_audit_task" },
+      { sessionID: a.id },
+    )
+    const task = await test.tools.task_state.execute(
+      { task_id: "T-audit", status: "done" },
+      { sessionID: b.id },
+    )
+    expect(task.content).toContain("STATUS\tdone")
+    await test.tools.revoke.execute({ to: b.id, operations: ["history"] }, { sessionID: a.id })
+
+    const audit = await test.tools.audit.execute({}, { sessionID: a.id })
+    expect(audit.content).toContain("\tgrant\t")
+    expect(audit.content).toContain("\tdelivery\t")
+    expect(audit.content).toContain("\trevoke\t")
+    const taskAudit = await test.tools.audit.execute({}, { sessionID: b.id })
+    expect(taskAudit.content).toContain("\ttask\t")
+  })
+
   it("lists external operations with an enforceable flag and warning", async () => {
     const { test, a } = await setupChain()
     const host = await test.tools.request_approval.execute(
