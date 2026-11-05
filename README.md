@@ -32,6 +32,8 @@ its own model, agent, permissions, and tab.
 - Artifact existence + sha256 verification on `verify` letters
 - Persistent outbox with retry + ACK (`postal_inbox`, `postal_resend`, `postal_retry`)
 - Relation grants (`postal_grant` / `postal_revoke` / `postal_relations`) for send/task/spawn/interrupt/close/history/approve
+- Operation-bound approvals (`postal_request_approval` / `postal_approve` / `postal_reject` / `postal_consume_approval`) with sha256 binding, expiry, and one-shot consume
+- Append-only audit (`postal_audit`) for grant, revoke, delivery, task, and approval decisions
 - Per-relation delivery modes (`interrupt` / `idle` / `inbox`)
 - Task state separate from message ACK (`postal_task_state`), plus `request` vs `assignment` kinds
 - `postal_tree` parent/child/ancestor view with spawn facts and grants
@@ -40,7 +42,7 @@ its own model, agent, permissions, and tab.
 - Idle-worker watchdog nudges and outbox TTL cleanup
 - Multiple connected peers per session
 - Ctrl+P commands: new session, connect, close session, disconnect peers, show
-  connected peers, show session tree, reset rally
+  connected peers, show session tree, grant operations, reset rally
 - Shared per-conversation rally counter (default 30 letters / 10 minutes)
 - RPC (`postal.connect` / `postal.disconnect` / `postal.status`) for exact TUI
   feedback
@@ -273,6 +275,37 @@ A spawn record is a fact (`spawn/<child>`); authority is a directed grant
 - `postal_tree` shows the hierarchy, `SPAWNED_BY`, and per-node grant
   annotations. The TUI command is `Postal: Show session tree`.
 
+### Approvals and audit
+
+An approval is bound to one operation payload: `operation`, `resource`, and
+sorted `parameters`, hashed with sha256. `postal_request_approval` creates a
+pending record (default 15 minutes, clamped to 1 minute–24 hours).
+`postal_approve` / `postal_reject` require the proposer's parent/owner or an
+`approve` grant holder; the proposer cannot approve its own request. One
+approval authorizes one execution, and a hash or executor mismatch fails
+closed.
+
+When a relation's `close` or `interrupt` rule has `approvalRequired` (the
+spawn-parent defaults do), `postal_close` / `postal_interrupt` need a matching
+`approval_id`. `postal_consume_approval` checks the same binding for guarded
+tools.
+
+| Operation | Enforceable | Default approval |
+| --- | --- | --- |
+| `send`, `task`, `history` | postal | off |
+| `spawn`, `interrupt`, `close`, `approve` | postal | on |
+| `host.shell`, `host.edit` | host integration | on |
+| `host.deploy` | none | on |
+
+Operations that Postal cannot see are shown as
+`approval required but not enforceable by Postal`; Postal records the decision
+but cannot block the host action. Set `enforceApprovals: false` for advisory
+mode (records are written, but `close`/`interrupt` do not require them).
+
+`postal_audit` returns append-only records for grants, revocations, delivery
+changes, task state, and approval request/approve/reject/consume. The caller
+sees its own records, or records for a target it may inspect with `history`.
+
 ### HMAC Phase 1
 
 Pairing creates a 32-byte HMAC-SHA256 key per pair (same location only). Every
@@ -377,6 +410,7 @@ and rally accounting.
 | `Postal: Disconnect peers` | Disconnect one peer, or every peer |
 | `Postal: Show connected peers` | Show every peer connected to the session |
 | `Postal: Show session tree` | Show the parent/child/ancestor tree with grants |
+| `Postal: Grant` | Pick a connected peer, toggle operations (`send`, `task`, `spawn`, `interrupt`, `close`, `history`, `approve`), and grant them |
 | `Postal: Reset rally` | Reset the shared rally counter |
 
 The picker sorts sessions by recency and uses fuzzy search over titles and IDs.
@@ -454,6 +488,7 @@ Pass plugin options with the object form:
         "rallyWindowMinutes": 10,
         "allowAncestorCommands": false,
         "orphanPolicy": "reparent",
+        "enforceApprovals": true,
         "hmacWindowSeconds": 120,
         "keyGraceHours": 24,
         "watchdogAfterSeconds": 300,
@@ -476,7 +511,9 @@ Pass plugin options with the object form:
 age; `keyGraceHours` (default 24) keeps a rotated key valid for verification.
 `watchdogAfterSeconds` (300), `watchdogIntervalSeconds` (600), and
 `watchdogMaxNudges` (2) tune nudges; `outboxTtlDays` (7) bounds outbox retention;
-`maxResends` (5) caps `postal_resend` per message. The SQLite lock/state DB is
+`maxResends` (5) caps `postal_resend` per message. `enforceApprovals` (default
+true) makes `close`/`interrupt` fail closed when the relation requires an
+approval; set it to false for advisory-only records. The SQLite lock/state DB is
 under `$XDG_STATE_HOME/opencode/postal` (or `~/.local/state/opencode/postal`);
 `POSTAL_STATE_PATH` overrides the file for tests or custom layouts.
 
@@ -526,6 +563,9 @@ tui.tsx     Ctrl+P commands, session picker, footer status
 sessions.ts session create/close/delete flow (testable without OpenTUI)
 status.ts   route/session identity for the footer, including new-session state
 rpc.ts      postal.connect / postal.disconnect / postal.status contract
+grants.ts   relation grants, spawn facts, delivery modes, authority cycles
+approvals.ts operation-bound approval records, hashing, expiry, consume
+audit.ts    append-only decision records
 lock.ts     per-conversation serialization for rally increments
 fuzzy.ts    fuzzy matcher for the session picker
 test/       Bun tests for multi-peer storage, async delivery, session lifecycle,

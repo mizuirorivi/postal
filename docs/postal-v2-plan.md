@@ -1,6 +1,6 @@
 # Postal v2 — requirements analysis and staged plan
 
-- Status: proposal, awaiting human approval
+- Status: M0–M3 implemented; awaiting final review and push approval
 - Baseline: Phase 1 `28b7c65` plus Phase 2 spike/lock work (`22c51ac`)
 - Date: 2026-11-05
 

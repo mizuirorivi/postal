@@ -36,6 +36,8 @@ picker matcher.
 | `spawn/<sessionID>` | Spawn fact (`spawnedBy`), separate from authority |
 | `parent/<sessionID>`, `children/<sessionID>` | Current hierarchy mirror used by tree/orphan handling |
 | `grants/index`, `grants/<from>/<to>` | Per-operation relation grants, delivery mode, tombstones |
+| `approval/index`, `approval/<approvalID>` | Operation-bound approval with sha256 hash, proposer/approver/executor, expiry, and status |
+| `audit/index`, `audit/<timestamp>_<random>` | Append-only grant, revoke, delivery, task, and approval decisions |
 | `task/index`, `task/<from>/<taskID>` | Task work state separate from message ACK |
 | `seen/<from>/<to>/<msgID>` | Receiver replay marker with a 24h TTL |
 | `rally/<min>:<max>` | Shared rally counter and window start for a session pair |
@@ -96,6 +98,20 @@ and the prompt hook ignores them, so they are not forwarded again.
   send/task/spawn/interrupt/close/history/approve. Spawn defaults: parent→child
   send/task/interrupt/close/history; child→parent send; paired non-parent send.
   Authority edges must form a DAG; `send` may be bidirectional.
+- **Approvals.** `postal_request_approval` stores a pending record bound by
+  sha256 over `operation`, `resource`, and sorted `parameters` (default 15
+  minutes, clamped to 1 minute–24 hours). The proposer's parent/owner or an
+  `approve` grant holder calls `postal_approve` / `postal_reject`; the proposer
+  cannot self-approve. `postal_consume_approval` checks the hash and executor,
+  then marks the record `consumed`; one approval authorizes one execution.
+  `postal_close` / `postal_interrupt` consume a matching approval when the
+  relation's rule has `approvalRequired` (spawn-parent defaults do). With
+  `enforceApprovals: false`, records are advisory and the operation runs without
+  consuming one. `host.shell`, `host.edit`, and `host.deploy` are recorded but
+  are not enforceable by Postal (a guarded tool must consume the approval).
+- **Audit.** `postal_audit` reads append-only records for grant, revoke,
+  delivery, task, and approval request/approve/reject/consume. The caller sees
+  its own records, or records for a target it may inspect with `history`.
 - **Tasks.** Assignment/task letters create `task/<from>/<taskID>` state
   (`open`/`in_progress`/`blocked`/`done`/`cancelled`). ACK does not complete a
   task; `postal_task` updates it. `request` uses `send`, `assignment` uses
@@ -142,6 +158,7 @@ Plugin options are read from the plugin entry in `opencode.json(c)`:
 | `maxRally` | 30 | Letters per conversation window |
 | `rallyWindowMinutes` | 10 | Rolling rally window |
 | `allowAncestorCommands` | false | Let any ancestor interrupt/close a descendant |
+| `enforceApprovals` | true | Require and consume approvals for approval-required close/interrupt; false writes advisory records only |
 | `orphanPolicy` | `reparent` | Child handling when a parent closes |
 | `hmacWindowSeconds` | 120 | Accepted `issued_at` skew (30–3600) |
 | `keyGraceHours` | 24 | Old-key verification grace after `postal_rekey` (1–168) |

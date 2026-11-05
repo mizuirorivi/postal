@@ -1,6 +1,6 @@
 # Postal v2 M3 — approvals and audit
 
-- Status: design proposal, awaiting approval
+- Status: implemented (M3); awaiting final review and push approval
 - Scope: F-09..F-11
 - Baseline: `818d12b` (M2 complete, 151 tests / 483 assertions)
 
@@ -191,3 +191,24 @@ M1/M2 lock and index patterns.
   explicit `allowSelfApproval` policy per operation/relation.
 - `host.*` operation names and parameters must be registered by the host
   integration; Postal should not invent shell/edit semantics.
+
+## 10. Implementation status
+
+- `8fd2a9c` adds `approvals.ts` (canonical sha256, expiry, proposer/approver/
+  executor, one-shot consume) and `audit.ts` (append-only decision records).
+- `d802d0e` registers `postal_request_approval`, `postal_approve`,
+  `postal_reject`, `postal_consume_approval`, `postal_approvals`, and
+  `postal_audit`; grant/revoke/delivery/task/approval transitions write audit
+  records, and audit failures never block the operation. `postal_close` and
+  `postal_interrupt` accept `approval_id` and consume a matching approval when
+  the relation rule has `approvalRequired`.
+- `90b7319` covers hash/target mismatch, expiry, one-shot consume, non-enforceable
+  `host.deploy`, audit decisions, and the required scenario (A supervises B
+  while B consults A, but A's close needs an approval from A's parent).
+- `enforceApprovals: false` keeps advisory mode for deployments that want the
+  record without blocking close/interrupt.
+- Full suite after M3: **178 pass / 0 fail / 588 assertions**.
+- Residual: `host.shell` / `host.edit` / `host.deploy` have no guarded-tool
+  integration in this repository; Postal records and displays them as
+  `approval required but not enforceable by Postal`.
+

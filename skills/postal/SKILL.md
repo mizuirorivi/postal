@@ -119,12 +119,23 @@ malicious tasks; permissions remain the real boundary.
   within the plugin process but are not a cross-process or filesystem lock.
 - `postal_interrupt` interrupts a session; `postal_close` deletes another
   session and disconnects its peers. Both require an active `interrupt` /
-  `close` grant. Default spawn grants give both to the parent; a paired peer
-  only gets `send`. On parent close, `orphanPolicy` controls children:
+  `close` grant. When the relation marks the operation approval-required (the
+  spawn-parent defaults do), pass `approval_id` from an approved
+  `postal_request_approval`. Default spawn grants give both to the parent; a
+  paired peer only gets `send`. On parent close, `orphanPolicy` controls children:
   `reparent` (default; notifies the grandparent with `kind: system`),
   `terminate` (deletes the subtree), or `detach` (orphans have no manager).
   `postal_status` shows `SESSION_PARENT`. A manually created session has no
   default authority grants.
+- Approvals are bound to `operation`, `resource`, and sorted `parameters` by a
+  sha256 hash. `postal_request_approval` creates a pending record (default 15
+  minutes). The proposer's parent/owner or an `approve` grant holder calls
+  `postal_approve` / `postal_reject`; the proposer cannot self-approve.
+  `postal_consume_approval` checks the hash and executor and marks the record
+  `consumed`; one approval authorizes one execution. `postal_audit` lists
+  grant, revoke, delivery, task, and approval decisions. `host.*` operations
+  are recorded but are not enforceable by Postal (guarded tools must consume
+  the approval themselves).
 - `postal_grant` / `postal_revoke` / `postal_relations` manage per-operation
   authority. `send` is bidirectional; `task`, `spawn`, `interrupt`, `close`,
   and `approve` must form a DAG. `postal_tree` shows the hierarchy and grants.
@@ -178,6 +189,9 @@ Tradeoffs:
   only that segment is green. Connected peers are also green in the session
   picker and in the connected-peers dialog.
 - `Ctrl+P → Postal: Disconnect peers` removes one peer, or every peer.
+- `Ctrl+P → Postal: Grant` picks a connected peer, toggles `send`, `task`,
+  `spawn`, `interrupt`, `close`, `history`, and `approve`, then grants them.
+  Authority operations still require the caller to be the peer's spawn parent.
 
 ## Troubleshooting
 
