@@ -16,7 +16,6 @@ import {
   questionKey,
   readQuestion,
   renderQuestionBody,
-  type FormAnswer,
   type FormInfo,
   type FormsContext,
   type FormsDeps,
@@ -132,13 +131,16 @@ export async function forwardQuestion(
 export async function handleFormReplied(
   ctx: FormsContext,
   deps: FormsDeps,
-  event: { data: { id: string; sessionID: string; answer: FormAnswer } },
+  event: { data?: { id?: unknown; sessionID?: unknown } },
   now = Date.now(),
 ): Promise<QuestionRecord | undefined> {
-  const key = questionKey(event.data.id)
+  const formID = typeof event.data?.id === "string" ? event.data.id : ""
+  const sessionID = typeof event.data?.sessionID === "string" ? event.data.sessionID : ""
+  if (!formID || !sessionID) return undefined
+  const key = questionKey(formID)
   const updated = await deps.lock(key, async () => {
-    const record = await readQuestion(ctx, event.data.id)
-    if (!record || record.asker !== event.data.sessionID || record.status !== "pending") {
+    const record = await readQuestion(ctx, formID)
+    if (!record || record.asker !== sessionID || record.status !== "pending") {
       return undefined
     }
     record.status = "answered"
@@ -165,13 +167,16 @@ export async function handleFormReplied(
 export async function handleFormCancelled(
   ctx: FormsContext,
   deps: FormsDeps,
-  event: { data: { id: string; sessionID: string } },
+  event: { data?: { id?: unknown; sessionID?: unknown } },
   now = Date.now(),
 ): Promise<QuestionRecord | undefined> {
-  const key = questionKey(event.data.id)
+  const formID = typeof event.data?.id === "string" ? event.data.id : ""
+  const sessionID = typeof event.data?.sessionID === "string" ? event.data.sessionID : ""
+  if (!formID || !sessionID) return undefined
+  const key = questionKey(formID)
   const updated = await deps.lock(key, async () => {
-    const record = await readQuestion(ctx, event.data.id)
-    if (!record || record.asker !== event.data.sessionID || record.status !== "pending") {
+    const record = await readQuestion(ctx, formID)
+    if (!record || record.asker !== sessionID || record.status !== "pending") {
       return undefined
     }
     record.status = "cancelled"

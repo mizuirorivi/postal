@@ -55,6 +55,13 @@ import {
   type Lock,
   type Operation,
 } from "./grants.js"
+import { answerQuestion } from "./question-answer.js"
+import {
+  forwardQuestion,
+  handleFormCancelled,
+  handleFormReplied,
+} from "./question-bridge.js"
+import type { FormsContext, FormsDeps } from "./forms.js"
 import { renderSessionTree } from "./tree.js"
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto"
 import { readFileSync, realpathSync, statSync } from "node:fs"
@@ -167,7 +174,17 @@ type ProjectedMessage = {
 type PeerRecord = { id: string; title: string }
 type PairResult = { ok: boolean; peerID?: string; title?: string; peers?: PeerRecord[]; error?: string }
 
-type EnvelopeKind = "task" | "assignment" | "request" | "status" | "verify" | "error" | "letter" | "system"
+type EnvelopeKind =
+  | "task"
+  | "assignment"
+  | "request"
+  | "question"
+  | "answer"
+  | "status"
+  | "verify"
+  | "error"
+  | "letter"
+  | "system"
 type EnvelopeArtifact = { path: string; sha256?: string }
 type EnvelopeCommand = { cmd: string; exit?: number }
 type Envelope = {
@@ -273,6 +290,8 @@ const ENVELOPE_KINDS = new Set<EnvelopeKind>([
   "task",
   "assignment",
   "request",
+  "question",
+  "answer",
   "status",
   "verify",
   "error",
@@ -1711,7 +1730,72 @@ async function disconnectLocked(ctx: PostalContext, sessionID: string, peerID?: 
   }
 }
 
-async function setup(ctx: PostalContext): Promise<void> {
+/** Adapters used by the question/answer bridge. */
+function formsDeps(ctx: PostalContext): FormsDeps {
+  return {
+    lock: stateLock(ctx),
+    readParent: async (target, sessionID) =>
+      (await readParent(target as unknown as PostalContext, sessionID))?.parentID,
+    authorizingAncestor: async (target, actor, sessionID) =>
+      authorizingAncestor(target as unknown as PostalContext, actor, sessionID),
+    postLetter: async (input) => {
+      const envelope = await postOnly(ctx, {
+        from: input.from,
+        to: input.to,
+        body: input.body,
+        rally: await nextRally(ctx, input.from, input.to),
+        max: maxRally(ctx),
+        envelope: { kind: input.kind, msgID: input.msgID, replyTo: input.replyTo },
+        delivery: input.delivery,
+      })
+      return { msgID: envelope.msgID }
+    },
+  }
+}
+
+/**
+ * Bridge host form events to Postal mail. Returns a cleanup; the plugin scope
+ * also closes the subscription when the plugin unloads.
+ */
+function startFormBridge(ctx: PostalContext): () => void {
+  const events = (
+    ctx as unknown as {
+      event?: {
+        subscribe?: (input: { types: string[] }) => AsyncIterable<{ type: string; data?: any }>
+      }
+    }
+  ).event
+  if (ctx.options?.questionBridge === false || !events?.subscribe) return () => {}
+  const controller = new AbortController()
+  const deps = formsDeps(ctx)
+  void (async () => {
+    try {
+      for await (const event of events.subscribe({
+        types: ["form.created", "form.replied", "form.cancelled"],
+      })) {
+        if (controller.signal.aborted) break
+        try {
+          if (event.type === "form.created") {
+            await forwardQuestion(ctx as FormsContext, deps, event.data?.form)
+          } else if (event.type === "form.replied") {
+            await handleFormReplied(ctx as FormsContext, deps, event)
+          } else if (event.type === "form.cancelled") {
+            await handleFormCancelled(ctx as FormsContext, deps, event)
+          }
+        } catch (error) {
+          console.warn(`postal: form bridge failed: ${errorText(error)}`)
+        }
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        console.warn(`postal: form bridge stopped: ${errorText(error)}`)
+      }
+    }
+  })()
+  return () => controller.abort()
+}
+
+async function setup(ctx: PostalContext): Promise<void | (() => void)> {
   try {
     await ctx.rpc.register(PostalRpc, {
       connect: async (input) => pair(ctx, String(input.sessionID), String(input.peerID)),
@@ -2138,6 +2222,40 @@ async function setup(ctx: PostalContext): Promise<void> {
     })
 
     editor.add({
+      name: "answer",
+      description:
+        "Answer a question form forwarded by postal_question. " +
+        "Only the asking session's parent or an ancestor with a task grant may answer; " +
+        "pass form_id from the [postal] question letter and an answer object keyed by field key.",
+      input: {
+        type: "object",
+        properties: {
+          form_id: { type: "string", description: "Form ID from the [postal] question letter" },
+          answer: {
+            type: "object",
+            description: "Field key -> string | number | boolean | string[]",
+            additionalProperties: true,
+          },
+        },
+        required: ["form_id", "answer"],
+        additionalProperties: false,
+      },
+      execute: async (input, context) => {
+        const value = input as { form_id?: unknown; answer?: unknown }
+        const formID = typeof value.form_id === "string" ? value.form_id : ""
+        const result = await answerQuestion(ctx as FormsContext, formsDeps(ctx), {
+          actor: context.sessionID,
+          formID,
+          answer: value.answer,
+        })
+        if (!result.ok) return { content: `postal: ${result.error}` }
+        return {
+          content: `postal: answered ${result.record.formID} for ${result.record.asker}`,
+        }
+      },
+    })
+
+    editor.add({
       name: "relations",
       description: "Show outgoing and incoming grants, spawn fact, enforceable flags, and approval requirements.",
       input: {
@@ -2341,7 +2459,18 @@ async function setup(ctx: PostalContext): Promise<void> {
           text: { type: "string", description: "Letter body to deliver" },
           kind: {
             type: "string",
-            enum: ["task", "assignment", "request", "status", "verify", "error", "letter", "system"],
+            enum: [
+              "task",
+              "assignment",
+              "request",
+              "question",
+              "answer",
+              "status",
+              "verify",
+              "error",
+              "letter",
+              "system",
+            ],
           },
           task_id: { type: "string" },
           reply_to: { type: "string" },
@@ -2528,7 +2657,18 @@ async function setup(ctx: PostalContext): Promise<void> {
           text: { type: "string" },
           kind: {
             type: "string",
-            enum: ["task", "assignment", "request", "status", "verify", "error", "letter", "system"],
+            enum: [
+              "task",
+              "assignment",
+              "request",
+              "question",
+              "answer",
+              "status",
+              "verify",
+              "error",
+              "letter",
+              "system",
+            ],
           },
           task_id: { type: "string" },
           reply_to: { type: "string" },
@@ -3063,6 +3203,10 @@ async function setup(ctx: PostalContext): Promise<void> {
     // Timers are optional in restricted runtimes.
   }
 
+  // Bridge host question forms to Postal mail. The returned cleanup stops the
+  // subscription when the plugin unloads; the plugin scope also closes it.
+  const stopFormBridge = startFormBridge(ctx)
+
   // Mention path: "@ses_XXXX ..." in a user prompt forwards the rest of the text.
   // Relay deliveries from this plugin are marked and never re-forwarded.
   // Connect handshake (from the TUI command) carries metadata.postal.connect.
@@ -3216,6 +3360,8 @@ async function setup(ctx: PostalContext): Promise<void> {
     if (!body) return
     void relayMention(ctx, { from, to, body })
   })
+
+  return stopFormBridge
 }
 
 // OpenCode validates this default shape. Keep the local plugin dependency-free
