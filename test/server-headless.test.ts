@@ -2086,3 +2086,36 @@ describe("v2 request and assignment", () => {
     expect(assignmentLine).toContain("\tassignment\topen")
   })
 })
+
+describe("v2 revocation propagation", () => {
+  it("revokes pending mail and cancels open tasks immediately", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+
+    await test.tools.send.execute({ to: b.id, text: "pending", msg_id: "msg_pending" }, { sessionID: "ses_a" })
+    const pendingKey = outboxKey("ses_a", "msg_pending")
+    const pending = test.storage.get(pendingKey) as any
+    pending.status = "pending"
+    pending.nextAt = 0
+    test.storage.set(pendingKey, pending)
+
+    await test.tools.send.execute(
+      { to: b.id, text: "assignment", kind: "assignment", task_id: "T2", msg_id: "msg_assign_revoke" },
+      { sessionID: "ses_a" },
+    )
+
+    const result = await test.tools.revoke.execute(
+      { to: b.id, operations: ["send", "task"] },
+      { sessionID: "ses_a" },
+    )
+    expect(result.content).toContain("REVOKED_RECORDS\tmsg_pending")
+    expect(result.content).toContain("CANCELLED_TASKS\tT2")
+    expect((test.storage.get(pendingKey) as any).status).toBe("revoked")
+
+    const inbox = await test.tools.inbox.execute({}, { sessionID: "ses_a" })
+    const taskLine = inbox.content.split("\n").find((line) => line.startsWith("msg_assign_revoke\t"))
+    expect(taskLine).toContain("cancelled")
+  })
+})

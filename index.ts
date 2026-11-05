@@ -2023,7 +2023,37 @@ async function setup(ctx: PostalContext): Promise<void> {
           : undefined
         const grant = await revokeOperations(ctx, stateLock(ctx), context.sessionID, to, operations)
         if (!grant) return { content: `postal: no grant for ${to}` }
-        return { content: `postal: revoked ${operations?.join(",") ?? "all"} for ${to}` }
+        const revoked: string[] = []
+        const cancelled: string[] = []
+        const current = await ensureGrant(ctx, stateLock(ctx), context.sessionID, to)
+        for (const record of await listOutbox(ctx, context.sessionID)) {
+          if (record.to !== to) continue
+          const operation: Operation =
+            record.envelope.kind === "task" || record.envelope.kind === "assignment" ? "task" : "send"
+          if (current && isRuleActive(current.operations[operation], operation)) continue
+          if (operation === "task") {
+            const task = await readTask(ctx, record.from, record.envelope.taskID ?? record.msgID)
+            if (task && !isTerminalTask(task.status)) {
+              await updateTask(ctx, stateLock(ctx), task.from, task.taskID, "cancelled", "grant_revoked")
+              cancelled.push(task.taskID)
+            }
+          }
+          if (record.status === "pending") {
+            await crossProcessLock(ctx, outboxKey(record.from, record.msgID), async () => {
+              record.status = "revoked"
+              record.lastError = "grant_revoked"
+              await updateOutbox(ctx, record)
+            })
+            revoked.push(record.msgID)
+          }
+        }
+        return {
+          content: [
+            `postal: revoked ${operations?.join(",") ?? "all"} for ${to}`,
+            `REVOKED_RECORDS\t${revoked.join(",") || "-"}`,
+            `CANCELLED_TASKS\t${cancelled.join(",") || "-"}`,
+          ].join("\n"),
+        }
       },
     })
 
