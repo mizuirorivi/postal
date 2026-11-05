@@ -11,6 +11,9 @@
 import { ensureGrant, isRuleActive } from "./grants.js"
 import {
   errorText,
+  isQuestionForm,
+  isSessionID,
+  isValidFormID,
   newQuestionMsgID,
   oneLineText,
   questionKey,
@@ -59,19 +62,19 @@ export async function forwardQuestion(
   form: FormInfo,
   now = Date.now(),
 ): Promise<ForwardResult> {
-  if (!form || form.metadata?.kind !== "question") {
+  if (!form || !isQuestionForm(form)) {
     return { status: "ignored", reason: "not_question" }
   }
-  if (
-    typeof form.id !== "string" ||
-    !form.id ||
-    typeof form.sessionID !== "string" ||
-    !form.sessionID
-  ) {
+  if (!isValidFormID(form.id) || !isSessionID(form.sessionID)) {
     return { status: "ignored", reason: "invalid_form" }
   }
   const target = await deps.readParent(ctx, form.sessionID)
-  if (!target || target === form.sessionID) return { status: "ignored", reason: "no_parent" }
+  if (!isSessionID(target) || target === form.sessionID) {
+    return { status: "ignored", reason: "no_parent" }
+  }
+  if (!(await deps.isPaired(ctx, form.sessionID, target))) {
+    return { status: "ignored", reason: "not_paired" }
+  }
   const grant = await ensureGrant(ctx, deps.lock, form.sessionID, target)
   if (!grant || !isRuleActive(grant.operations.send, "send")) {
     return { status: "ignored", reason: "send_not_granted" }
@@ -136,7 +139,7 @@ export async function handleFormReplied(
 ): Promise<QuestionRecord | undefined> {
   const formID = typeof event.data?.id === "string" ? event.data.id : ""
   const sessionID = typeof event.data?.sessionID === "string" ? event.data.sessionID : ""
-  if (!formID || !sessionID) return undefined
+  if (!isValidFormID(formID) || !isSessionID(sessionID)) return undefined
   const key = questionKey(formID)
   const updated = await deps.lock(key, async () => {
     const record = await readQuestion(ctx, formID)
@@ -158,7 +161,7 @@ export async function handleFormReplied(
       ctx,
       deps,
       updated,
-      `Question ${updated.formID} ("${updated.title}") was answered${by}. You do not need to answer it.`,
+      `Question ${oneLineText(updated.formID, 160)} ("${updated.title}") was answered${by}. You do not need to answer it.`,
     )
   }
   return updated
@@ -172,7 +175,7 @@ export async function handleFormCancelled(
 ): Promise<QuestionRecord | undefined> {
   const formID = typeof event.data?.id === "string" ? event.data.id : ""
   const sessionID = typeof event.data?.sessionID === "string" ? event.data.sessionID : ""
-  if (!formID || !sessionID) return undefined
+  if (!isValidFormID(formID) || !isSessionID(sessionID)) return undefined
   const key = questionKey(formID)
   const updated = await deps.lock(key, async () => {
     const record = await readQuestion(ctx, formID)
@@ -191,7 +194,7 @@ export async function handleFormCancelled(
     ctx,
     deps,
     updated,
-    `Question ${updated.formID} ("${updated.title}") was cancelled. You do not need to answer it.`,
+    `Question ${oneLineText(updated.formID, 160)} ("${updated.title}") was cancelled. You do not need to answer it.`,
   )
   return updated
 }

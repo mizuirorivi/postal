@@ -10,6 +10,8 @@
  * enter Postal storage. Forms are location-scoped and expire after 10 minutes.
  */
 import { readFileSync } from "node:fs"
+import { request as httpRequest } from "node:http"
+import { request as httpsRequest } from "node:https"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import type { Lock } from "./grants.js"
@@ -53,6 +55,7 @@ export type QuestionRecord = {
   createdAt: number
   updatedAt: number
   settlingBy?: string
+  settlingAt?: number
   answeredBy?: string
   answeredAt?: number
   cancelledAt?: number
@@ -60,6 +63,7 @@ export type QuestionRecord = {
 }
 
 export type FormsContext = {
+  location?: { directory: string }
   storage: {
     get(key: string): Promise<unknown>
     set(key: string, value: unknown): Promise<void>
@@ -91,8 +95,9 @@ export type FormsDeps = {
   lock: Lock
   readParent: (ctx: FormsContext, sessionID: string) => Promise<string | undefined>
   authorizingAncestor: (ctx: FormsContext, actor: string, target: string) => Promise<string | undefined>
+  isPaired: (ctx: FormsContext, from: string, to: string) => Promise<boolean>
   postLetter: (input: PostLetterInput) => Promise<{ msgID: string }>
-  fetch?: typeof fetch
+  timeoutMs?: number
   env?: Record<string, string | undefined>
   home?: string
   readFile?: (path: string) => string
@@ -112,6 +117,8 @@ const QUESTION_PREFIX = "question/"
 const MAX_ANSWER_BYTES = 64 * 1024
 const MAX_ANSWER_FIELDS = 64
 const MAX_LETTER_BYTES = 8 * 1024
+const MAX_RESPONSE_BYTES = 4 * 1024
+const DEFAULT_TIMEOUT_MS = 5000
 
 export function questionKey(formID: string): string {
   return `${QUESTION_PREFIX}${encodeURIComponent(formID)}`
@@ -123,7 +130,34 @@ export function errorText(error: unknown): string {
 
 export function oneLineText(value: unknown, limit: number): string {
   if (typeof value !== "string") return ""
-  return value.replace(/\s+/g, " ").trim().slice(0, limit)
+  return value
+    .slice(0, Math.max(limit * 4, 256))
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, limit)
+}
+
+/** Form IDs are host-generated (`frm_...`); restrict them before using them in keys/bodies. */
+export function isValidFormID(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,160}$/.test(value)
+}
+
+/** Session IDs are `ses_...`; restrict them before using them in records/letters. */
+export function isSessionID(value: unknown): value is string {
+  return typeof value === "string" && /^ses_[A-Za-z0-9_-]{1,160}$/.test(value)
+}
+
+/**
+ * Only the host `question` tool's forms are forwarded. The tool stamps
+ * `metadata.tool = { messageID, id }`; requiring it excludes generic forms that
+ * merely set `metadata.kind`.
+ */
+export function isQuestionForm(form: FormInfo): boolean {
+  const metadata = form?.metadata
+  if (!metadata || metadata.kind !== "question") return false
+  const tool = metadata.tool
+  return Boolean(tool && typeof tool === "object" && typeof (tool as { id?: unknown }).id === "string")
 }
 
 export function newQuestionMsgID(): string {
@@ -141,8 +175,7 @@ export async function readQuestion(
 function normalizeQuestion(value: unknown, formID: string): QuestionRecord | undefined {
   if (!value || typeof value !== "object") return undefined
   const record = value as Partial<QuestionRecord>
-  if (typeof record.asker !== "string" || !record.asker) return undefined
-  if (typeof record.target !== "string" || !record.target) return undefined
+  if (!isSessionID(record.asker) || !isSessionID(record.target)) return undefined
   if (typeof record.msgID !== "string") return undefined
   return {
     formID,
@@ -157,6 +190,7 @@ function normalizeQuestion(value: unknown, formID: string): QuestionRecord | und
     ...(typeof record.settlingBy === "string" && record.settlingBy
       ? { settlingBy: record.settlingBy }
       : {}),
+    ...(typeof record.settlingAt === "number" ? { settlingAt: record.settlingAt } : {}),
     ...(typeof record.answeredBy === "string" && record.answeredBy
       ? { answeredBy: record.answeredBy }
       : {}),
@@ -170,9 +204,10 @@ function normalizeQuestion(value: unknown, formID: string): QuestionRecord | und
 export function renderQuestionBody(form: FormInfo, askerTitle?: string): string {
   const title = oneLineText(form.title, 200) || "(untitled question)"
   const from = oneLineText(askerTitle, 120)
+  const formID = oneLineText(form.id, 160)
   const lines = [
-    `Question from ${form.sessionID}${from ? ` (${from})` : ""}: ${title}`,
-    `form_id: ${form.id}`,
+    `Question from ${oneLineText(form.sessionID, 160)}${from ? ` (${from})` : ""}: ${title}`,
+    `form_id: ${formID}`,
     "fields:",
   ]
   for (const field of form.fields.slice(0, 32)) {
@@ -195,7 +230,7 @@ export function renderQuestionBody(form: FormInfo, askerTitle?: string): string 
       lines.push(`  options: ${options}`)
     }
   }
-  lines.push(`Answer with postal_answer({ form_id: "${form.id}", answer: { ... } }).`)
+  lines.push(`Answer with postal_answer({ form_id: "${formID}", answer: { ... } }).`)
   lines.push("The asking session is blocked until the form is answered or cancelled.")
   return lines.join("\n").slice(0, MAX_LETTER_BYTES)
 }
@@ -253,14 +288,23 @@ export async function replyToForm(
   const runtime = ctx.session?.form
   if (runtime && typeof runtime.reply === "function") {
     try {
-      await runtime.reply({
-        sessionID: input.sessionID,
-        formID: input.formID,
-        answer: input.answer,
-      })
+      await withTimeout(
+        Promise.resolve(
+          runtime.reply({
+            sessionID: input.sessionID,
+            formID: input.formID,
+            answer: input.answer,
+          }),
+        ),
+        deps.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      )
       return { ok: true, via: "runtime" }
     } catch (error) {
-      return { ok: false, error: `form reply failed: ${errorText(error)}`, via: "runtime" }
+      return {
+        ok: false,
+        error: `form reply failed: ${oneLineText(errorText(error), 300)}`,
+        via: "runtime",
+      }
     }
   }
 
@@ -272,29 +316,100 @@ export async function replyToForm(
         "form reply API not available: ctx.session.form.reply is missing and no loopback OpenCode service registration was found",
     }
   }
-  const url = new URL(
-    `/api/session/${encodeURIComponent(input.sessionID)}/form/${encodeURIComponent(input.formID)}/reply`,
-    endpoint.url,
-  )
-  const auth = `Basic ${Buffer.from(`${endpoint.username}:${endpoint.password}`).toString("base64")}`
+  const path = `/api/session/${encodeURIComponent(input.sessionID)}/form/${encodeURIComponent(input.formID)}/reply`
+  const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS
   try {
-    const response = await (deps.fetch ?? fetch)(url, {
-      method: "POST",
-      headers: { authorization: auth, "content-type": "application/json" },
-      body: JSON.stringify({ answer: input.answer }),
-      signal: AbortSignal.timeout(5000),
-    })
+    const response = await postFormReply(endpoint, path, { answer: input.answer }, timeoutMs)
     if (response.status === 204) return { ok: true, via: "http" }
-    const text = await response.text().catch(() => "")
     return {
       ok: false,
       status: response.status,
-      error: `form reply failed (HTTP ${response.status})${text ? `: ${sanitizeError(text)}` : ""}`,
+      error: `form reply failed (HTTP ${response.status})${response.text ? `: ${sanitizeError(response.text)}` : ""}`,
       via: "http",
     }
   } catch (error) {
-    return { ok: false, error: `form reply request failed: ${errorText(error)}`, via: "http" }
+    return {
+      ok: false,
+      error: `form reply request failed: ${oneLineText(errorText(error), 300)}`,
+      via: "http",
+    }
   }
+}
+
+/**
+ * POST directly with node:http/https.
+ *
+ * Bun's `fetch` honors HTTP_PROXY/HTTPS_PROXY and forwards Authorization
+ * headers through the proxy, which would leak the local server password.
+ * node:http ignores proxy environment variables, does not follow redirects,
+ * and lets us cap the response body and the request lifetime.
+ */
+function postFormReply(
+  endpoint: ServiceEndpoint,
+  path: string,
+  body: unknown,
+  timeoutMs: number,
+): Promise<{ status: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(path, endpoint.url)
+    const send = url.protocol === "https:" ? httpsRequest : httpRequest
+    const payload = JSON.stringify(body)
+    const request = send(
+      url,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Basic ${Buffer.from(
+            `${endpoint.username}:${endpoint.password}`,
+          ).toString("base64")}`,
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(payload),
+        },
+        timeout: timeoutMs,
+      },
+      (response) => {
+        const chunks: Buffer[] = []
+        let size = 0
+        response.on("data", (chunk: Buffer) => {
+          if (size >= MAX_RESPONSE_BYTES) return
+          const part = chunk.subarray(0, MAX_RESPONSE_BYTES - size)
+          chunks.push(part)
+          size += part.length
+        })
+        response.on("end", () => {
+          resolve({
+            status: response.statusCode ?? 0,
+            text: Buffer.concat(chunks).toString("utf8"),
+          })
+        })
+        response.on("error", reject)
+      },
+    )
+    request.on("timeout", () => {
+      request.destroy(new Error(`form reply timed out after ${timeoutMs}ms`))
+    })
+    request.on("error", reject)
+    request.end(payload)
+  })
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`form reply timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+    timer.unref?.()
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error) => {
+        clearTimeout(timer)
+        reject(error)
+      },
+    )
+  })
 }
 
 function sanitizeError(text: string): string {
@@ -350,12 +465,8 @@ function safeServiceURL(value: string): string | undefined {
   try {
     const url = new URL(value)
     if (url.protocol !== "http:" && url.protocol !== "https:") return undefined
-    if (
-      url.protocol === "http:" &&
-      !["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname)
-    ) {
-      return undefined
-    }
+    if (url.username || url.password) return undefined
+    if (!["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname)) return undefined
     return url.toString().replace(/\/$/, "")
   } catch {
     return undefined

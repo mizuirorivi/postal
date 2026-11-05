@@ -8,6 +8,7 @@
  */
 import { ensureGrant, isRuleActive } from "./grants.js"
 import {
+  isValidFormID,
   questionKey,
   readQuestion,
   replyToForm,
@@ -21,6 +22,9 @@ export type AnswerResult =
   | { ok: true; record: QuestionRecord }
   | { ok: false; error: string; status?: number }
 
+/** A crashed/hung answerer must not block the question forever. */
+const STALE_SETTLING_MS = 30_000
+
 export async function answerQuestion(
   ctx: FormsContext,
   deps: FormsDeps,
@@ -28,7 +32,8 @@ export async function answerQuestion(
   now = Date.now(),
 ): Promise<AnswerResult> {
   const formID = typeof input.formID === "string" ? input.formID.trim() : ""
-  if (!formID || formID.length > 256) return { ok: false, error: "form_id is required" }
+  if (!formID) return { ok: false, error: "form_id is required" }
+  if (!isValidFormID(formID)) return { ok: false, error: `invalid form_id: ${formID}` }
   const record = await readQuestion(ctx, formID)
   if (!record) {
     return {
@@ -62,10 +67,13 @@ export async function answerQuestion(
     if (!current || current.status !== "pending") {
       return { error: `question already settled: ${formID}` }
     }
-    if (current.settlingBy && current.settlingBy !== input.actor) {
-      return { error: `question is being answered by ${current.settlingBy}` }
+    if (current.settlingBy) {
+      const stale =
+        typeof current.settlingAt === "number" && now - current.settlingAt > STALE_SETTLING_MS
+      if (!stale) return { error: `question is being answered by ${current.settlingBy}` }
     }
     current.settlingBy = input.actor
+    current.settlingAt = now
     current.updatedAt = now
     await ctx.storage.set(key, current)
     return { record: current }
@@ -82,16 +90,18 @@ export async function answerQuestion(
       const current = await readQuestion(ctx, formID)
       if (!current || current.status !== "pending" || current.settlingBy !== input.actor) return
       delete current.settlingBy
+      delete current.settlingAt
       current.updatedAt = Date.now()
-      if (reply.status === 404) {
+      if (reply.status === 404 && /form not found/i.test(reply.error)) {
         current.status = "cancelled"
         current.cancelledAt = Date.now()
         current.note = "form_not_found"
       } else if (reply.status === 409) {
+        // The host rejected this answer; do not credit the actor.
         current.status = "answered"
-        current.answeredBy = input.actor
-        current.answeredAt = Date.now()
         current.note = "form_already_settled"
+      } else {
+        current.note = "form_state_unknown"
       }
       await ctx.storage.set(key, current)
     })
@@ -111,6 +121,7 @@ export async function answerQuestion(
       current.answeredAt = Date.now()
       current.updatedAt = Date.now()
       delete current.settlingBy
+      delete current.settlingAt
       await ctx.storage.set(key, current)
     } else if (current.status === "answered" && !current.answeredBy) {
       current.answeredBy = input.actor
