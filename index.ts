@@ -48,9 +48,11 @@ type PostalMeta = {
     msgID?: string
     replyTo?: string
     kind?: string
+    taskID?: string
     signature?: string
     keyID?: string
     issuedAt?: number
+    sigVersion?: number
     reason?: string
     peer?: { id?: string; title?: string }
   }
@@ -512,18 +514,59 @@ async function ensureHmacRecord(ctx: PostalContext, a: string, b: string): Promi
   })
 }
 
+const HMAC_VERSION = 2
+
+/** Canonical signed payload: the rendered letter plus every metadata field used for decisions. */
+function signaturePayload(input: {
+  keyID: string
+  issuedAt: number
+  from: string
+  to: string
+  msgID: string
+  kind: string
+  taskID?: string
+  replyTo?: string
+  letter: string
+}): string {
+  return JSON.stringify([
+    "postal-hmac-v2",
+    input.keyID,
+    input.issuedAt,
+    input.from,
+    input.to,
+    input.msgID,
+    input.kind,
+    input.taskID ?? null,
+    input.replyTo ?? null,
+    input.letter,
+  ])
+}
+
 async function signLetter(
   ctx: PostalContext,
   from: string,
   to: string,
   letter: string,
-): Promise<{ signature: string; keyID: string; issuedAt: number }> {
+  envelope: Envelope,
+): Promise<{ signature: string; keyID: string; issuedAt: number; sigVersion: number }> {
   const record = await ensureHmacRecord(ctx, from, to)
   const issuedAt = Date.now()
   const signature = createHmac("sha256", record.current.key)
-    .update(`${record.current.keyID}\n${issuedAt}\n${letter}`)
+    .update(
+      signaturePayload({
+        keyID: record.current.keyID,
+        issuedAt,
+        from,
+        to,
+        msgID: envelope.msgID,
+        kind: envelope.kind,
+        taskID: envelope.taskID,
+        replyTo: envelope.replyTo,
+        letter,
+      }),
+    )
     .digest("hex")
-  return { signature, keyID: record.current.keyID, issuedAt }
+  return { signature, keyID: record.current.keyID, issuedAt, sigVersion: HMAC_VERSION }
 }
 
 async function verifyLetter(
@@ -531,11 +574,22 @@ async function verifyLetter(
   from: string,
   to: string,
   letter: string,
-  meta: { signature?: string; keyID?: string; issuedAt?: number },
+  meta: {
+    signature?: string
+    keyID?: string
+    issuedAt?: number
+    sigVersion?: number
+    msgID?: string
+    kind?: string
+    taskID?: string
+    replyTo?: string
+  },
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
-  if (!from || !meta.signature || !meta.keyID || typeof meta.issuedAt !== "number") {
+  if (!from || !to || !meta.signature || !meta.keyID || typeof meta.issuedAt !== "number") {
     return { ok: false, reason: "missing_signature" }
   }
+  if (meta.sigVersion !== HMAC_VERSION) return { ok: false, reason: "unsupported_signature_version" }
+  if (!meta.msgID || !meta.kind) return { ok: false, reason: "missing_signature" }
   if (Math.abs(Date.now() - meta.issuedAt) > hmacWindowMs(ctx)) {
     return { ok: false, reason: "stale_signature" }
   }
@@ -547,7 +601,19 @@ async function verifyLetter(
   )
   if (candidates.length === 0) return { ok: false, reason: "unknown_key" }
   const expected = createHmac("sha256", candidates[0].key)
-    .update(`${meta.keyID}\n${meta.issuedAt}\n${letter}`)
+    .update(
+      signaturePayload({
+        keyID: meta.keyID,
+        issuedAt: meta.issuedAt,
+        from,
+        to,
+        msgID: meta.msgID,
+        kind: meta.kind,
+        taskID: meta.taskID,
+        replyTo: meta.replyTo,
+        letter,
+      }),
+    )
     .digest("hex")
   if (expected.length !== meta.signature.length) return { ok: false, reason: "invalid_signature" }
   try {
@@ -658,7 +724,7 @@ async function postOnly(
     }
   }
 
-  const signed = await signLetter(ctx, options.from, options.to, letter)
+  const signed = await signLetter(ctx, options.from, options.to, letter, envelope)
   await ctx.session.prompt({
     sessionID: options.to,
     text: letter,
@@ -671,9 +737,11 @@ async function postOnly(
         msgID: envelope.msgID,
         replyTo: envelope.replyTo,
         kind: envelope.kind,
+        taskID: envelope.taskID,
         signature: signed.signature,
         keyID: signed.keyID,
         issuedAt: signed.issuedAt,
+        sigVersion: signed.sigVersion,
       },
     },
   })

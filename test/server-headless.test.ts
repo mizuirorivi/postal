@@ -1011,3 +1011,57 @@ describe("artifact containment", () => {
     rmSync(root, { recursive: true, force: true })
   })
 })
+
+describe("HMAC metadata binding", () => {
+  it("rejects metadata that differs from the signed envelope", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+    await test.tools.send.execute(
+      { to: b.id, text: "signed", kind: "letter", task_id: "T1", reply_to: "T0", msg_id: "msg_bound" },
+      { sessionID: "ses_a" },
+    )
+    const sent = test.prompts.at(-1)!
+
+    for (const patch of [{ kind: "task" }, { msgID: "msg_other" }, { replyTo: "msg_other" }, { taskID: "T2" }]) {
+      const event = {
+        sessionID: b.id,
+        prompt: { text: sent.text },
+        metadata: structuredClone(sent.metadata),
+      }
+      Object.assign((event.metadata as any).postal, patch)
+      await test.hooks.prompt(event)
+      expect(event.prompt.text).toBe("")
+      expect((event.metadata as any).postal.reason).toBe("invalid_signature")
+    }
+
+    const spoofed = {
+      sessionID: b.id,
+      prompt: { text: sent.text },
+      metadata: structuredClone(sent.metadata),
+    }
+    ;(spoofed.metadata as any).postal.from = "ses_c"
+    await test.hooks.prompt(spoofed)
+    expect(spoofed.prompt.text).toBe("")
+    expect((spoofed.metadata as any).postal.reason).toBe("unknown_key")
+  })
+
+  it("rejects letters signed with the legacy version", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.tools.send.execute({ to: "ses_b", text: "signed", msg_id: "msg_v1" }, { sessionID: "ses_a" })
+    const sent = test.prompts.at(-1)!
+    const event = {
+      sessionID: "ses_b",
+      prompt: { text: sent.text },
+      metadata: structuredClone(sent.metadata),
+    }
+    delete (event.metadata as any).postal.sigVersion
+    await test.hooks.prompt(event)
+    expect(event.prompt.text).toBe("")
+    expect((event.metadata as any).postal.reason).toBe("unsupported_signature_version")
+  })
+})
