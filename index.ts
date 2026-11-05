@@ -54,6 +54,7 @@ import {
   type DeliveryMode,
   type Lock,
   type Operation,
+  type RelationGrant,
 } from "./grants.js"
 import { answerQuestion } from "./question-answer.js"
 import {
@@ -1704,6 +1705,37 @@ async function peerStatus(ctx: PostalContext, sessionID: string): Promise<PairRe
   }
 }
 
+type GrantMutation = { ok: true; grant: RelationGrant } | { ok: false; error: string }
+
+/**
+ * Grant operations from an acting session. Shared by the postal_grant tool and
+ * the TUI RPC so authority checks cannot drift between the two entry points.
+ */
+async function grantFromSession(
+  ctx: PostalContext,
+  sessionID: string,
+  to: string,
+  operations: Operation[],
+  options: { approvalRequired?: boolean; expiresAt?: number } = {},
+): Promise<GrantMutation> {
+  if (operations.length === 0) return { ok: false, error: "at least one valid operation is required" }
+  const authority = operations.filter((operation) => operation !== "send")
+  if (authority.length > 0) {
+    const parentRecord = (await ctx.storage.get(`parent/${to}`)) as { parentID?: unknown } | undefined
+    const spawn = await readSpawnFact(ctx, to)
+    const owner = typeof parentRecord?.parentID === "string" ? parentRecord.parentID : spawn?.spawnedBy
+    if (owner !== sessionID) {
+      return { ok: false, error: "only the spawn parent can grant authority over a session" }
+    }
+  }
+  try {
+    const grant = await grantOperations(ctx, stateLock(ctx), sessionID, to, operations, options)
+    return { ok: true, grant }
+  } catch (error) {
+    return { ok: false, error: errorText(error) }
+  }
+}
+
 /** Disconnect one peer, or every peer when peerID is omitted. */
 async function disconnect(ctx: PostalContext, sessionID: string, peerID?: string): Promise<PairResult> {
   return crossProcessLock(ctx, "peers", () => disconnectLocked(ctx, sessionID, peerID))
@@ -1829,6 +1861,30 @@ async function setup(ctx: PostalContext): Promise<void | (() => void)> {
         })
         const spawn = await readSpawnFact(ctx, sessionID)
         return { ok: true, tree: `SPAWNED_BY\t${spawn?.spawnedBy ?? "-"}\n${tree}` }
+      },
+      grant: async (input) => {
+        const sessionID = String(input.sessionID)
+        const peerID = String(input.peerID)
+        const operations = Array.isArray(input.operations)
+          ? input.operations.filter(
+              (operation): operation is Operation =>
+                typeof operation === "string" && (OPERATIONS as readonly string[]).includes(operation),
+            )
+          : []
+        const result = await grantFromSession(ctx, sessionID, peerID, operations, {
+          ...(typeof input.approvalRequired === "boolean" ? { approvalRequired: input.approvalRequired } : {}),
+          ...(typeof input.expiresAt === "number" ? { expiresAt: input.expiresAt } : {}),
+        })
+        if (!result.ok) return { ok: false, error: result.error }
+        return {
+          ok: true,
+          peerID,
+          grant: [
+            `OPERATIONS\t${operations.join(",")}`,
+            `DELIVERY\t${result.grant.delivery}`,
+            `UPDATED_AT\t${new Date(result.grant.updatedAt).toISOString()}`,
+          ].join("\n"),
+        }
       },
       presence: async (input) => {
         const sessions = Array.isArray(input.sessions) ? input.sessions : []
@@ -2056,30 +2112,17 @@ async function setup(ctx: PostalContext): Promise<void | (() => void)> {
             )
           : []
         if (operations.length === 0) return { content: "postal: at least one valid operation is required" }
-        const authority = operations.filter((operation) => operation !== "send")
-        if (authority.length > 0) {
-          const parentRecord = (await ctx.storage.get(`parent/${to}`)) as { parentID?: unknown } | undefined
-          const spawn = await readSpawnFact(ctx, to)
-          const owner =
-            typeof parentRecord?.parentID === "string" ? parentRecord.parentID : spawn?.spawnedBy
-          if (owner !== context.sessionID) {
-            return { content: "postal: only the spawn parent can grant authority over a session" }
-          }
-        }
-        try {
-          const grant = await grantOperations(ctx, stateLock(ctx), context.sessionID, to, operations, {
-            ...(typeof value.approvalRequired === "boolean" ? { approvalRequired: value.approvalRequired } : {}),
-            ...(typeof value.expiresAt === "number" ? { expiresAt: value.expiresAt } : {}),
-          })
-          return {
-            content: [
-              `GRANTED\t${to}`,
-              `OPERATIONS\t${operations.join(",")}`,
-              `UPDATED_AT\t${new Date(grant.updatedAt).toISOString()}`,
-            ].join("\n"),
-          }
-        } catch (error) {
-          return { content: `postal: grant failed: ${errorText(error)}` }
+        const result = await grantFromSession(ctx, context.sessionID, to, operations, {
+          ...(typeof value.approvalRequired === "boolean" ? { approvalRequired: value.approvalRequired } : {}),
+          ...(typeof value.expiresAt === "number" ? { expiresAt: value.expiresAt } : {}),
+        })
+        if (!result.ok) return { content: `postal: grant failed: ${result.error}` }
+        return {
+          content: [
+            `GRANTED\t${to}`,
+            `OPERATIONS\t${operations.join(",")}`,
+            `UPDATED_AT\t${new Date(result.grant.updatedAt).toISOString()}`,
+          ].join("\n"),
         }
       },
     })

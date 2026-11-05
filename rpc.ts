@@ -13,6 +13,7 @@ const result = {
     peerID: { type: "string" },
     title: { type: "string" },
     tree: { type: "string" },
+    grant: { type: "string" },
     peers: {
       type: "array",
       items: {
@@ -80,6 +81,27 @@ export const PostalRpc = {
           all: { type: "boolean" },
         },
         required: ["sessionID"],
+        additionalProperties: false,
+      },
+      output: result,
+    },
+    grant: {
+      input: {
+        type: "object",
+        properties: {
+          sessionID: { type: "string" },
+          peerID: { type: "string" },
+          operations: {
+            type: "array",
+            items: {
+              type: "string",
+              enum: ["send", "task", "spawn", "interrupt", "close", "history", "approve"],
+            },
+          },
+          approvalRequired: { type: "boolean" },
+          expiresAt: { type: "number", description: "Epoch milliseconds" },
+        },
+        required: ["sessionID", "peerID", "operations"],
         additionalProperties: false,
       },
       output: result,

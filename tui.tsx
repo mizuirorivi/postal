@@ -7,6 +7,7 @@
  *   Postal: Close session          close the tab or delete the session
  *   Postal: Disconnect peers      remove one peer, or every peer
  *   Postal: Show connected peers  show every connected peer
+ *   Postal: Grant                 grant operations to a connected peer
  *   Postal: Reset rally           reset the shared rally counter
  *
  * The current session is taken from the router when available; otherwise the
@@ -16,6 +17,7 @@
 import { RGBA } from "@opentui/core"
 import { createEffect, createSignal, on } from "solid-js"
 import { fuzzySearch } from "./fuzzy.js"
+import { OPERATIONS, OPERATION_SPECS, type Operation } from "./grants.js"
 import { PostalRpc } from "./rpc.js"
 import { closeSessionCommand, newSessionCommand } from "./sessions.js"
 import {
@@ -118,6 +120,13 @@ type TuiContext = {
         peers?: PeerRecord[]
         error?: string
       }>
+      grant(input: {
+        sessionID: string
+        peerID: string
+        operations: string[]
+        approvalRequired?: boolean
+        expiresAt?: number
+      }): Promise<{ ok?: boolean; peerID?: string; grant?: string; error?: string }>
       presence(input: {
         sessions: Array<{
           id: string
@@ -544,6 +553,132 @@ async function showTree(context: TuiContext): Promise<void> {
   }
 }
 
+async function grantCommand(context: TuiContext): Promise<void> {
+  const sessionID = await resolveSession(context, "Postal: Select session to grant from")
+  if (!sessionID) return
+  const rpc = context.client.rpc?.(PostalRpc)
+  if (!rpc) {
+    context.ui.toast.show({ title: "Postal", message: "Grant is unavailable: RPC is not connected", variant: "error" })
+    return
+  }
+
+  let peers: PeerRecord[] = []
+  try {
+    const status = await rpc.status({ sessionID })
+    if (status?.ok === false) {
+      context.ui.toast.show({
+        title: "Postal",
+        message: `Grant failed: ${status.error ?? "peer lookup failed"}`,
+        variant: "error",
+      })
+      return
+    }
+    peers = (status.peers ?? []).filter((peer) => peer.id !== sessionID)
+  } catch (error) {
+    context.ui.toast.show({ title: "Postal", message: `Grant failed: ${errorMessage(error)}`, variant: "error" })
+    return
+  }
+  if (peers.length === 0) {
+    context.ui.toast.show({
+      title: "Postal",
+      message: "No connected peers. Use Postal: Select peer session first.",
+      variant: "warning",
+    })
+    return
+  }
+
+  let peerID: string | undefined
+  try {
+    peerID = await context.ui.dialog.select({
+      title: "Postal: Grant to peer",
+      placeholder: "Search connected peers",
+      options: peers.map((peer) => ({
+        title: peer.title?.trim() || "(untitled)",
+        value: peer.id,
+        description: peer.id,
+      })),
+      search: fuzzySearch,
+    })
+  } catch (error) {
+    context.ui.toast.show({ title: "Postal", message: `Select peer failed: ${errorMessage(error)}`, variant: "error" })
+    return
+  }
+  if (!peerID) return
+
+  // The dialog API has no multiselect, so re-open a toggle list until Done.
+  const selected = new Set<Operation>()
+  for (;;) {
+    let choice: string | undefined
+    try {
+      choice = await context.ui.dialog.select({
+        title: `Postal: Grant operations (${selected.size} selected)`,
+        placeholder: "Enter toggles an operation; choose Done to continue",
+        options: [
+          ...OPERATIONS.map((operation) => ({
+            title: `${selected.has(operation) ? "[x]" : "[ ]"} ${operation}`,
+            value: operation,
+            description:
+              OPERATION_SPECS[operation].label +
+              (OPERATION_SPECS[operation].defaultApprovalRequired ? " (approval required)" : ""),
+          })),
+          {
+            title: "Done",
+            value: "__done__",
+            description: selected.size
+              ? `Grant ${[...selected].join(", ")} to ${peerID}`
+              : "Select at least one operation",
+          },
+        ],
+      })
+    } catch (error) {
+      context.ui.toast.show({
+        title: "Postal",
+        message: `Select operations failed: ${errorMessage(error)}`,
+        variant: "error",
+      })
+      return
+    }
+    if (!choice) return
+    if (choice === "__done__") break
+    if ((OPERATIONS as readonly string[]).includes(choice)) {
+      const operation = choice as Operation
+      if (selected.has(operation)) selected.delete(operation)
+      else selected.add(operation)
+    }
+  }
+  if (selected.size === 0) {
+    context.ui.toast.show({ title: "Postal", message: "No operations selected", variant: "warning" })
+    return
+  }
+
+  const operations = OPERATIONS.filter((operation) => selected.has(operation))
+  const confirmed = await context.ui.dialog.confirm({
+    title: "Postal: Grant",
+    message: `Grant ${operations.join(", ")} from ${sessionID} to ${peerID}?`,
+    label: { confirm: "Grant", cancel: "Cancel" },
+  })
+  if (!confirmed) return
+
+  try {
+    const result = await rpc.grant({ sessionID, peerID, operations: [...operations] })
+    if (result?.ok === false) {
+      context.ui.toast.show({
+        title: "Postal",
+        message: `Grant failed: ${result.error ?? "grant failed"}`,
+        variant: "error",
+      })
+      return
+    }
+    context.ui.toast.show({
+      title: "Postal",
+      message: `Granted ${operations.join(", ")} to ${peerID}`,
+    })
+    refreshPeerState?.()
+  } catch (error) {
+    context.ui.toast.show({ title: "Postal", message: `Grant failed: ${errorMessage(error)}`, variant: "error" })
+  }
+}
+
 const plugin = {
   id: "postal.tui",
   setup(context: TuiContext) {
@@ -708,6 +843,13 @@ const plugin = {
           group: "Postal",
           palette: true,
           run: () => showPeers(context),
+        },
+        {
+          id: "postal.grant",
+          title: "Postal: Grant",
+          group: "Postal",
+          palette: true,
+          run: () => grantCommand(context),
         },
         {
           id: "postal.resetRally",

@@ -1852,6 +1852,66 @@ describe("v2 relation grants", () => {
   })
 })
 
+describe("v2 grant rpc", () => {
+  it("grants send to a paired peer and reports the result", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+
+    const result = await test.rpc.grant({
+      sessionID: "ses_a",
+      peerID: "ses_b",
+      operations: ["send"],
+    })
+    expect(result.ok).toBe(true)
+    expect(result.peerID).toBe("ses_b")
+    expect(result.grant).toContain("OPERATIONS\tsend")
+    const grant = test.storage.get("grants/ses_a/ses_b") as any
+    expect(grant.operations.send.allowed).toBe(true)
+  })
+
+  it("lets the spawn parent grant authority but not the child", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+
+    const parent = await test.rpc.grant({
+      sessionID: "ses_a",
+      peerID: b.id,
+      operations: ["send", "history"],
+    })
+    expect(parent.ok).toBe(true)
+
+    const child = await test.rpc.grant({
+      sessionID: b.id,
+      peerID: "ses_a",
+      operations: ["interrupt"],
+    })
+    expect(child.ok).toBe(false)
+    expect(child.error).toContain("only the spawn parent")
+  })
+
+  it("rejects an empty or unknown operation list", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+
+    const empty = await test.rpc.grant({ sessionID: "ses_a", peerID: "ses_b", operations: [] })
+    expect(empty.ok).toBe(false)
+    expect(empty.error).toContain("at least one valid operation")
+
+    const unknown = await test.rpc.grant({
+      sessionID: "ses_a",
+      peerID: "ses_b",
+      operations: ["bogus"],
+    })
+    expect(unknown.ok).toBe(false)
+  })
+})
+
 describe("v2 grant enforcement", () => {
   it("blocks delivery at retry when a grant is revoked", async () => {
     const test = await boot()
