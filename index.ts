@@ -860,9 +860,14 @@ async function listOutbox(ctx: PostalContext, from?: string): Promise<OutboxReco
   return records.filter((record): record is OutboxRecord => Boolean(record) && (!from || record!.from === from))
 }
 
-async function markOutboxAcked(ctx: PostalContext, msgID: string): Promise<void> {
+async function markOutboxAcked(
+  ctx: PostalContext,
+  msgID: string,
+  expected: { sessionID: string; peerID: string },
+): Promise<void> {
   const record = await getOutbox(ctx, msgID)
   if (!record) return
+  if (record.from !== expected.sessionID || record.to !== expected.peerID) return
   if (record.status === "delivered" || record.status === "pending") {
     record.status = "acked"
     record.ackedAt = Date.now()
@@ -2211,8 +2216,17 @@ async function setup(ctx: PostalContext): Promise<void> {
           return
         }
       }
-      for (const msgID of [meta.postal.msgID, meta.postal.replyTo]) {
-        if (typeof msgID === "string" && msgID.length > 0) void markOutboxAcked(ctx, msgID)
+      // ACK means "the peer replied to this letter", never "the envelope was admitted".
+      // System nudges must not acknowledge the task they are watching.
+      if (
+        meta.postal.kind !== "system" &&
+        typeof meta.postal.replyTo === "string" &&
+        meta.postal.replyTo.length > 0
+      ) {
+        void markOutboxAcked(ctx, meta.postal.replyTo, {
+          sessionID: event.sessionID,
+          peerID: String(meta.postal.from ?? ""),
+        })
       }
       return
     }

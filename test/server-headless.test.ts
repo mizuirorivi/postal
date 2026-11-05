@@ -1065,3 +1065,101 @@ describe("HMAC metadata binding", () => {
     expect((event.metadata as any).postal.reason).toBe("unsupported_signature_version")
   })
 })
+
+describe("ACK semantics", () => {
+  it("does not ack a letter just because the receiver admitted it", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.tools.send.execute({ to: "ses_b", text: "hello", msg_id: "msg_admit_only" }, { sessionID: "ses_a" })
+    const sent = test.prompts.at(-1)!
+    await test.hooks.prompt({
+      sessionID: "ses_b",
+      prompt: { text: sent.text },
+      metadata: structuredClone(sent.metadata),
+    })
+    await flush()
+    expect((test.storage.get("outbox/msg_admit_only") as any).status).toBe("delivered")
+  })
+
+  it("keeps an admitted task visible to the watchdog", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+    await test.tools.send.execute(
+      { to: b.id, text: "do it", kind: "task", task_id: "T1", msg_id: "msg_admit_task" },
+      { sessionID: "ses_a" },
+    )
+    const sent = test.prompts.at(-1)!
+    await test.hooks.prompt({
+      sessionID: b.id,
+      prompt: { text: sent.text },
+      metadata: structuredClone(sent.metadata),
+    })
+    await flush()
+
+    const watchdog = await test.tools.watchdog.execute({ afterSeconds: 0 }, { sessionID: "ses_a" })
+    expect(watchdog.content).toContain("msg_admit_task")
+    expect(watchdog.content).toContain("NUDGED\t-")
+  })
+
+  it("does not let a watchdog nudge ack the task it monitors", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+    await test.rpc.presence({ sessions: [{ id: b.id, title: "B", state: "idle", pending: [] }] })
+    await test.tools.send.execute(
+      { to: b.id, text: "do it", kind: "task", task_id: "T1", msg_id: "msg_nudge_task" },
+      { sessionID: "ses_a" },
+    )
+    const first = await test.tools.watchdog.execute({ afterSeconds: 0 }, { sessionID: "ses_a" })
+    expect(first.content).toContain("NUDGED\tmsg_nudge_task")
+    const nudge = test.prompts.at(-1)!
+    expect((nudge.metadata as any).postal.kind).toBe("system")
+
+    await test.hooks.prompt({
+      sessionID: b.id,
+      prompt: { text: nudge.text },
+      metadata: structuredClone(nudge.metadata),
+    })
+    await flush()
+    expect((test.storage.get("outbox/msg_nudge_task") as any).status).toBe("delivered")
+
+    // Simulate the nudge interval elapsing; the task must still be monitored.
+    const record = test.storage.get("outbox/msg_nudge_task") as any
+    record.lastNudgeAt = 0
+    test.storage.set("outbox/msg_nudge_task", record)
+    const second = await test.tools.watchdog.execute({ afterSeconds: 0 }, { sessionID: "ses_a" })
+    expect(second.content).toContain("msg_nudge_task")
+    expect(second.content).toContain("NUDGED\tmsg_nudge_task")
+    expect((test.storage.get("outbox/msg_nudge_task") as any).nudges).toBe(2)
+  })
+
+  it("ignores an ack for a record addressed to another peer", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    test.addSession("ses_c", "C")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.rpc.connect({ sessionID: "ses_b", peerID: "ses_c" })
+    await test.tools.send.execute(
+      { to: "ses_b", text: "task", kind: "task", task_id: "T1", msg_id: "msg_cross_task" },
+      { sessionID: "ses_a" },
+    )
+    await test.tools.send.execute(
+      { to: "ses_b", text: "fake ack", reply_to: "msg_cross_task", msg_id: "msg_cross_ack" },
+      { sessionID: "ses_c" },
+    )
+    const forged = test.prompts.at(-1)!
+    await test.hooks.prompt({
+      sessionID: "ses_b",
+      prompt: { text: forged.text },
+      metadata: structuredClone(forged.metadata),
+    })
+    await flush()
+    expect((test.storage.get("outbox/msg_cross_task") as any).status).toBe("delivered")
+  })
+})
