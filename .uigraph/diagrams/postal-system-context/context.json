@@ -1,51 +1,298 @@
 {
-  "name": "Postal System Context",
-  "description": "The Postal server and TUI plugins inside OpenCode, with the runtime, sessions, and plugin storage they use.",
   "nodes": {
     "human": {
+      "type": "shape",
       "name": "Human",
+      "shape": "rectangle",
       "data": {
-        "Role": { "type": "Text Input", "value": "Writes prompts and runs Ctrl+P commands" }
+        "Role": {
+          "type": "Text Input",
+          "value": "Writes prompts and runs Ctrl+P commands"
+        }
+      },
+      "style": {
+        "width": 100,
+        "height": 58
+      },
+      "___internal": {
+        "source": "mermaid"
+      },
+      "___position": {
+        "x": 100,
+        "y": 255.38
       }
     },
     "session_a": {
+      "type": "shape",
       "name": "OpenCode Session A",
+      "shape": "rectangle",
       "data": {
-        "Identity": { "type": "Text Input", "value": "ses_... with its own model, agent, and transcript" }
-      }
-    },
-    "session_b": {
-      "name": "OpenCode Session B",
-      "data": {
-        "Identity": { "type": "Text Input", "value": "Peer session with its own model, agent, and transcript" }
-      }
-    },
-    "postal_server": {
-      "name": "Postal Server Plugin",
-      "data": {
-        "Entry": { "type": "Text Input", "value": "index.ts" },
-        "Provides": { "type": "Text Input", "value": "tools, RPC, prompt hook, retry timer" }
+        "Identity": {
+          "type": "Text Input",
+          "value": "ses_... with its own model, agent, and transcript"
+        }
+      },
+      "style": {
+        "width": 132,
+        "height": 58
+      },
+      "___internal": {
+        "source": "mermaid"
+      },
+      "___position": {
+        "x": 384,
+        "y": 156.38
       }
     },
     "postal_tui": {
+      "type": "shape",
       "name": "Postal TUI",
+      "shape": "rectangle",
       "data": {
-        "Entry": { "type": "Text Input", "value": "tui.tsx" },
-        "Provides": { "type": "Text Input", "value": "Ctrl+P commands, picker, footer" }
+        "Entry": {
+          "type": "Text Input",
+          "value": "tui.tsx"
+        },
+        "Provides": {
+          "type": "Text Input",
+          "value": "Ctrl+P commands, picker, footer"
+        }
+      },
+      "style": {
+        "width": 140,
+        "height": 58
+      },
+      "___internal": {
+        "source": "mermaid"
+      },
+      "___position": {
+        "x": 380,
+        "y": 334.38
+      }
+    },
+    "postal_server": {
+      "type": "shape",
+      "name": "Postal Server Plugin",
+      "shape": "rectangle",
+      "data": {
+        "Entry": {
+          "type": "Text Input",
+          "value": "index.ts"
+        },
+        "Provides": {
+          "type": "Text Input",
+          "value": "tools, RPC, prompt hook, retry timer"
+        }
+      },
+      "style": {
+        "width": 220,
+        "height": 58
+      },
+      "___internal": {
+        "source": "mermaid"
+      },
+      "___position": {
+        "x": 700,
+        "y": 284.88
+      }
+    },
+    "session_b": {
+      "type": "shape",
+      "name": "OpenCode Session B",
+      "shape": "rectangle",
+      "data": {
+        "Identity": {
+          "type": "Text Input",
+          "value": "Peer session with its own model, agent, and transcript"
+        }
+      },
+      "style": {
+        "width": 132,
+        "height": 58
+      },
+      "___internal": {
+        "source": "mermaid"
+      },
+      "___position": {
+        "x": 1476,
+        "y": 334.38
       }
     },
     "kv": {
       "type": "shape",
-      "shape": "cylinder",
       "name": "Plugin KV Storage",
+      "shape": "cylinder",
       "data": {
-        "Keys": { "type": "Text Input", "value": "peers/, rally/, outbox/, presence/" }
+        "Keys": {
+          "type": "Text Input",
+          "value": "peers/, rally/, outbox/, presence/"
+        }
+      },
+      "___internal": {
+        "source": "mermaid"
+      },
+      "___position": {
+        "x": 1100,
+        "y": 100
       }
     },
     "runtime": {
+      "type": "shape",
       "name": "OpenCode Runtime",
+      "shape": "rectangle",
       "data": {
-        "API": { "type": "Text Input", "value": "session.prompt, session.create, storage, rpc" }
+        "API": {
+          "type": "Text Input",
+          "value": "session.prompt, session.create, storage, rpc"
+        }
+      },
+      "style": {
+        "width": 188,
+        "height": 58
+      },
+      "___internal": {
+        "source": "mermaid"
+      },
+      "___position": {
+        "x": 1145.2294946147472,
+        "y": 246.14926263463133
+      }
+    }
+  },
+  "edges": {
+    "human-session_a": {
+      "type": "smoothstep",
+      "sourceHandle": "source-right",
+      "targetHandle": "target-left",
+      "label": "writes prompt",
+      "style": {
+        "strokeWidth": 2.5
+      },
+      "markerEnd": {
+        "type": "arrowclosed"
+      },
+      "___internal": {
+        "source": "mermaid"
+      }
+    },
+    "human-postal_tui": {
+      "type": "smoothstep",
+      "sourceHandle": "source-right",
+      "targetHandle": "target-left",
+      "label": "Ctrl+P commands",
+      "style": {
+        "strokeWidth": 2.5
+      },
+      "markerEnd": {
+        "type": "arrowclosed"
+      },
+      "___internal": {
+        "source": "mermaid"
+      }
+    },
+    "session_a-postal_server": {
+      "type": "smoothstep",
+      "sourceHandle": "source-right",
+      "targetHandle": "target-left",
+      "label": "prompt hook",
+      "style": {
+        "strokeWidth": 2.5
+      },
+      "markerEnd": {
+        "type": "arrowclosed"
+      },
+      "___internal": {
+        "source": "mermaid"
+      }
+    },
+    "session_b-postal_server": {
+      "type": "smoothstep",
+      "sourceHandle": "source-left",
+      "targetHandle": "target-right",
+      "label": "postal_send replies",
+      "style": {
+        "strokeWidth": 2.5
+      },
+      "markerEnd": {
+        "type": "arrowclosed"
+      },
+      "___internal": {
+        "source": "mermaid"
+      }
+    },
+    "postal_tui-postal_server": {
+      "type": "smoothstep",
+      "sourceHandle": "source-right",
+      "targetHandle": "target-left",
+      "label": "RPC and status",
+      "style": {
+        "strokeWidth": 2.5
+      },
+      "markerEnd": {
+        "type": "arrowclosed"
+      },
+      "___internal": {
+        "source": "mermaid"
+      }
+    },
+    "postal_server-kv": {
+      "type": "smoothstep",
+      "sourceHandle": "source-right",
+      "targetHandle": "target-left",
+      "label": "peers outbox rally",
+      "style": {
+        "strokeWidth": 2.5
+      },
+      "markerEnd": {
+        "type": "arrowclosed"
+      },
+      "___internal": {
+        "source": "mermaid"
+      }
+    },
+    "postal_server-runtime": {
+      "type": "smoothstep",
+      "sourceHandle": "source-right",
+      "targetHandle": "target-left",
+      "label": "steers prompts",
+      "style": {
+        "strokeWidth": 2.5
+      },
+      "markerEnd": {
+        "type": "arrowclosed"
+      },
+      "___internal": {
+        "source": "mermaid"
+      }
+    },
+    "runtime-session_b": {
+      "type": "smoothstep",
+      "sourceHandle": "source-right",
+      "targetHandle": "target-left",
+      "label": "delivers letters",
+      "style": {
+        "strokeWidth": 2.5
+      },
+      "markerEnd": {
+        "type": "arrowclosed"
+      },
+      "___internal": {
+        "source": "mermaid"
+      }
+    },
+    "postal_tui-human": {
+      "type": "smoothstep",
+      "sourceHandle": "source-left",
+      "targetHandle": "target-right",
+      "label": "footer identity",
+      "style": {
+        "strokeWidth": 2.5
+      },
+      "markerEnd": {
+        "type": "arrowclosed"
+      },
+      "___internal": {
+        "source": "mermaid"
       }
     }
   }
