@@ -26,17 +26,21 @@ its own model, agent, permissions, and tab.
 - `postal_send` tool for AI-to-AI letters (non-blocking)
 - `postal_directory`, `postal_peers`, and `postal_spawn` tools for address discovery and worker creation
 - Structured envelopes (`kind`, `task_id`, `reply_to`, artifacts, commands, `msg_id`)
-- HMAC Phase 1: per-pair keys, signed envelopes, ±120s window, 24h key grace, task parent/ancestor allowlist
+- HMAC Phase 1: per-pair keys, signed envelopes, ±120s window, 24h key grace, task grants
 - `postal_status` (rally budget / last letter / busy-idle / inbox count) and `postal_log` (postal audit)
 - TUI presence bridge for live busy/idle and pending-inbox metadata
 - Artifact existence + sha256 verification on `verify` letters
-- Persistent outbox with retry + ACK (`postal_inbox`, `postal_resend`)
+- Persistent outbox with retry + ACK (`postal_inbox`, `postal_resend`, `postal_retry`)
+- Relation grants (`postal_grant` / `postal_revoke` / `postal_relations`) for send/task/spawn/interrupt/close/history/approve
+- Per-relation delivery modes (`interrupt` / `idle` / `inbox`)
+- Task state separate from message ACK (`postal_task`), plus `request` vs `assignment` kinds
+- `postal_tree` parent/child/ancestor view with spawn facts and grants
 - Advisory claims (`postal_claim` / `postal_release`)
-- Agent lifecycle (`postal_interrupt`, `postal_close`) with a spawn-parent allowlist, and `postal_broadcast`
+- Agent lifecycle (`postal_interrupt`, `postal_close`) with grant checks, and `postal_broadcast`
 - Idle-worker watchdog nudges and outbox TTL cleanup
 - Multiple connected peers per session
 - Ctrl+P commands: new session, connect, close session, disconnect peers, show
-  connected peers, reset rally
+  connected peers, show session tree, reset rally
 - Shared per-conversation rally counter (default 30 letters / 10 minutes)
 - RPC (`postal.connect` / `postal.disconnect` / `postal.status`) for exact TUI
   feedback
@@ -226,7 +230,14 @@ Every `postal_send` writes a sender-scoped outbox record before delivery:
   carries `invalid_signature` or `unauthorized_task`
 - `acked`: the peer replied with `reply_to: <msg_id>`; admission alone does not
   count as an ACK
+- `revoked`: the relation no longer grants `send`/`task`; pending mail is
+  stopped and an open assignment task is cancelled
 - `failed`: all retry attempts were exhausted
+
+Task work state is separate from message state: `postal_task` moves a task
+through `open`, `in_progress`, `blocked`, `done`, or `cancelled`. An ACK does not
+complete a task, and a completed task stops watchdog nudges. `postal_inbox`
+shows `TASK_STATUS` next to the message status.
 
 The receiver writes a receipt under `receipt/<from>/<to>/<msg_id>` for every
 accepted letter and for authenticated rejections. `postal_inbox` reconciles
@@ -237,6 +248,30 @@ outbox, `postal_resend` to clear a rejection and retry, and `postal_retry` to
 scan due pending records. This is a delivery queue, not the AI's pending inbox.
 When the rally limit is reached, pass `queueOnLimit: true` to retry after the
 window instead of rejecting the letter.
+
+### Relations, grants, delivery, and tasks
+
+A spawn record is a fact (`spawn/<child>`); authority is a directed grant
+(`grants/<from>/<to>`) per operation. The default grants are:
+
+| Relation | Default operations |
+| --- | --- |
+| spawn parent → child | `send`, `task`, `interrupt`, `close`, `history` |
+| child → parent | `send` (consultation) |
+| paired non-parent | `send` both directions |
+| legacy ancestor (`allowAncestorCommands`) | `interrupt`, `close` only |
+
+- `postal_grant` adds operations to your own side of a relation; authority
+  grants require the spawn parent/owner. `postal_revoke` writes a tombstone.
+- Authority edges (`task`, `spawn`, `interrupt`, `close`, `approve`) must form a
+  DAG; `send` may be bidirectional.
+- `postal_delivery` sets `interrupt` (steer immediately, default), `idle`
+  (steer only when presence is idle, otherwise queue), or `inbox` (queue with
+  `resume: false`, drained on the target's next turn).
+- `request` is collaborative and needs `send`; `assignment` is forced and needs
+  `task`. `task` remains a legacy alias for `assignment`.
+- `postal_tree` shows the hierarchy, `SPAWNED_BY`, and per-node grant
+  annotations. The TUI command is `Postal: Show session tree`.
 
 ### HMAC Phase 1
 
@@ -252,12 +287,14 @@ it:
 - an invalid or missing signature clears the body and records
   `reason` (`invalid_signature`, `missing_signature`, `stale_signature`,
   `unknown_key`) in `postal` metadata
-- `kind: "task"` is accepted only from the target's parent or an ancestor
+- `kind: "task"` / `assignment` requires an active `task` grant; the default
+  parent→child grant provides it, while a child only has `send` to its parent
 - `postal_rekey` rotates a pair key; the old key verifies for `keyGraceHours`
   (default 24; clamp 1–168), then expires
 
-Manual root sessions have no parent, so agents cannot send them `kind: "task"`
-letters. This is intentional least privilege.
+Manual root sessions have no parent, so they have no default `task` grant and
+cannot receive forced assignments from agents. This is intentional least
+privilege; grant `task` explicitly when needed.
 
 ### Watchdog and cleanup
 
@@ -324,9 +361,9 @@ and rally accounting.
   TUI→server bridge; message bodies stay in the TUI. Body previews are an
   explicit future opt-in.
 - **HMAC Phase 1** authenticates the pair, not intent: a compromised peer with
-  the pair key can still sign a malicious task. Task letters are additionally
-  limited to parent/ancestor sessions. Keys live in the plugin KV and are
-  same-location only; cross-location key distribution is Phase 2.
+  the pair key can still sign a malicious task. Task/assignment authority is
+  checked against grants at send and admission; keys live in the plugin KV and
+  are shared across locations on the same server.
 - **Manual root sessions** cannot receive `kind: "task"` from agents because
   they have no parent. Use the TUI or create a spawned worker.
 
@@ -339,6 +376,7 @@ and rally accounting.
 | `Postal: Close session` | Close the tab, or permanently delete the session after confirmation |
 | `Postal: Disconnect peers` | Disconnect one peer, or every peer |
 | `Postal: Show connected peers` | Show every peer connected to the session |
+| `Postal: Show session tree` | Show the parent/child/ancestor tree with grants |
 | `Postal: Reset rally` | Reset the shared rally counter |
 
 The picker sorts sessions by recency and uses fuzzy search over titles and IDs.
@@ -421,7 +459,8 @@ Pass plugin options with the object form:
         "watchdogAfterSeconds": 300,
         "watchdogIntervalSeconds": 600,
         "watchdogMaxNudges": 2,
-        "outboxTtlDays": 7
+        "outboxTtlDays": 7,
+        "maxResends": 5
       }
     }
   ]
@@ -430,12 +469,16 @@ Pass plugin options with the object form:
 
 `maxRally` is the per-conversation letter limit (default 30).
 `rallyWindowMinutes` is the rolling window (default 10). Both are per-pair.
-`allowAncestorCommands` lets any ancestor interrupt/close a descendant; the
-default is direct-parent only. `orphanPolicy` is `reparent` (default),
+`allowAncestorCommands` is read only to migrate legacy ancestor
+`interrupt`/`close` grants; runtime authority uses grants. `orphanPolicy` is
+`reparent` (default),
 `terminate`, or `detach`. `hmacWindowSeconds` (default 120) bounds signature
 age; `keyGraceHours` (default 24) keeps a rotated key valid for verification.
 `watchdogAfterSeconds` (300), `watchdogIntervalSeconds` (600), and
-`watchdogMaxNudges` (2) tune nudges; `outboxTtlDays` (7) bounds outbox retention.
+`watchdogMaxNudges` (2) tune nudges; `outboxTtlDays` (7) bounds outbox retention;
+`maxResends` (5) caps `postal_resend` per message. The SQLite lock/state DB is
+under `$XDG_STATE_HOME/opencode/postal` (or `~/.local/state/opencode/postal`);
+`POSTAL_STATE_PATH` overrides the file for tests or custom layouts.
 
 ## Security model
 

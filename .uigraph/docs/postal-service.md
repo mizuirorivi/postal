@@ -33,7 +33,11 @@ picker matcher.
 | --- | --- |
 | `peers/<sessionID>` | Array of connected peers (`{ id, title }`) |
 | `peer/<sessionID>` | Legacy single-peer record, migrated on first read |
-| `parent/<sessionID>`, `children/<sessionID>` | Spawn hierarchy used by interrupt/close authorization and orphan handling |
+| `spawn/<sessionID>` | Spawn fact (`spawnedBy`), separate from authority |
+| `parent/<sessionID>`, `children/<sessionID>` | Current hierarchy mirror used by tree/orphan handling |
+| `grants/index`, `grants/<from>/<to>` | Per-operation relation grants, delivery mode, tombstones |
+| `task/index`, `task/<from>/<taskID>` | Task work state separate from message ACK |
+| `seen/<from>/<to>/<msgID>` | Receiver replay marker with a 24h TTL |
 | `rally/<min>:<max>` | Shared rally counter and window start for a session pair |
 | `last/<min>:<max>` | Timestamp of the last letter in a pair |
 | `msg/<from>/<msgID>` | Sender-scoped delivered-message marker for idempotency |
@@ -45,7 +49,9 @@ picker matcher.
 
 ## Delivery model
 
-Every delivery uses `delivery: "steer"`; Postal never queues a reply or notice.
+Delivery mode is per relation: `interrupt` uses `steer`, `idle` steers only when
+presence is idle and otherwise queues, and `inbox` queues with `resume: false`
+(non-waking, drained on the next turn). System notices always steer.
 The receiver gets a `[postal]` letter with the sender label, rally position,
 `msg_id`, kind, optional task/reply IDs, envelope details, and an instruction to
 reply with `postal_send`. Relay deliveries carry `metadata.postal.relay = true`
@@ -80,18 +86,28 @@ and the prompt hook ignores them, so they are not forwarded again.
   receiver rebuilds the payload from metadata, verifies within
   `hmacWindowSeconds` (default 120), and clears the body with a `reason` when the
   signature is missing, stale, invalid, or from an unsupported version.
-  `kind: "task"` is accepted only from the target's parent or an ancestor, and
-  the receipt records the authorizing ancestor. `postal_rekey` rotates a key;
-  the old key verifies for `keyGraceHours` (default 24). Keys are same-location
-  only in Phase 1.
+  `kind: "task"` / `assignment` requires an active `task` grant; the receipt
+  records the grant holder. `postal_rekey` rotates a key; the old key verifies
+  for `keyGraceHours` (default 24). Keys are plugin-scoped and shared across
+  locations on the same server.
 - **Broadcast.** Each peer gets its own outbox record and rally accounting, with
   a per-peer suffix on the idempotency key.
-- **Watchdog.** Delivered `kind: "task"` records that remain unacked are checked
-  against TUI presence. Idle workers receive a `kind: "system"` nudge with the
-  original `reply_to`; running workers are skipped. Defaults: 300s age, 600s
-  between nudges, 2 nudges. Unknown presence is skipped unless explicitly
-  allowed.
-- **Outbox cleanup.** Delivered/rejected/acked/failed records older than
+- **Grants.** `postal_grant` / `postal_revoke` / `postal_relations` manage
+  send/task/spawn/interrupt/close/history/approve. Spawn defaults: parent→child
+  send/task/interrupt/close/history; child→parent send; paired non-parent send.
+  Authority edges must form a DAG; `send` may be bidirectional.
+- **Tasks.** Assignment/task letters create `task/<from>/<taskID>` state
+  (`open`/`in_progress`/`blocked`/`done`/`cancelled`). ACK does not complete a
+  task; `postal_task` updates it. `request` uses `send`, `assignment` uses
+  `task`; `task` remains the legacy alias.
+- **Watchdog.** Delivered task/assignment records that remain unacked and are
+  not terminal are checked against TUI presence. Idle workers receive a
+  `kind: "system"` nudge with the original `reply_to`; running workers are
+  skipped. Defaults: 300s age, 600s between nudges, 2 nudges.
+- **Revocation.** `postal_revoke` marks pending matching outbox records
+  `revoked`, cancels open assignment tasks, and `attemptOutbox` re-checks grants
+  on every retry.
+- **Outbox cleanup.** Delivered/rejected/revoked/acked/failed records older than
   `outboxTtlDays` (default 7) are removed together with their receipts;
   sender-scoped `msg` idempotency markers remain. The background timer runs a
   real cleanup; the tool defaults to a dry run.

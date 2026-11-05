@@ -72,23 +72,25 @@ Use `postal_log` for recent `[postal]` messages from a transcript.
 
 ## Watchdog and cleanup
 
-- `postal_watchdog` finds delivered `kind: "task"` letters that are still
-  unacked and nudges idle workers with `kind: "system"`. Use `dryRun` to inspect
-  candidates. Running workers are skipped; unknown presence needs
-  `nudgeUnknown`. Defaults: 300s age, 600s interval, 2 nudges.
-- `postal_cleanup` removes old delivered/acked/failed outbox records
-  (`outboxTtlDays`, default 7). It is a dry run unless `dryRun: false` is passed.
-  Idempotency `msg` markers remain.
+- `postal_watchdog` finds delivered `kind: "task"` / `assignment` letters that
+  are still unacked and whose task state is not terminal. It nudges idle
+  workers with `kind: "system"`. Use `dryRun` to inspect candidates. Running
+  workers are skipped; unknown presence needs `nudgeUnknown`. Defaults: 300s
+  age, 600s interval, 2 nudges.
+- `postal_cleanup` removes old delivered/rejected/revoked/acked/failed outbox
+  records (`outboxTtlDays`, default 7). It is a dry run unless `dryRun: false`
+  is passed. Idempotency `msg` markers remain.
 
 ## HMAC Phase 1
 
 Pairing creates a per-pair HMAC-SHA256 key (same location only). Every letter is
 signed; the receiver verifies before the AI sees it. `issued_at` is accepted
 within `hmacWindowSeconds` (default 120). Invalid signatures clear the body and
-set `postal.reason` metadata. `kind: "task"` is accepted only from the target's
-parent or an ancestor. `postal_rekey` rotates a key; the old key verifies for
-`keyGraceHours` (default 24). A compromised pair key can still sign malicious
-tasks; permissions remain the real boundary.
+set `postal.reason` metadata. `kind: "task"` / `assignment` requires an active
+`task` grant; the default parent→child grant provides it, while a child only
+gets `send` to its parent. `postal_rekey` rotates a key; the old key verifies
+for `keyGraceHours` (default 24). A compromised pair key can still sign
+malicious tasks; permissions remain the real boundary.
 
 ## Reliability and coordination
 
@@ -98,7 +100,11 @@ tasks; permissions remain the real boundary.
   records.
 - Outbox states: `pending`, `delivered` (the host accepted the prompt),
   `rejected` (the receiver rejected the envelope; reason in `lastError`),
-  `acked` (the peer replied with `reply_to`), and `failed`.
+  `revoked` (the relation revoked send/task), `acked` (the peer replied with
+  `reply_to`), and `failed`.
+- Task state is separate from message ACK: `postal_task` moves a task through
+  `open`, `in_progress`, `blocked`, `done`, or `cancelled`. ACK does not complete
+  a task; `done`/`cancelled` stop watchdog nudges.
 - Admission alone is not an ACK. A reply that includes `reply_to: <msg_id>`
   marks the original letter `acked`; the watchdog keeps watching delivered
   tasks until that reply arrives.
@@ -112,13 +118,21 @@ tasks; permissions remain the real boundary.
   locks for paths or task IDs. Re-claim to heartbeat. They are serialized
   within the plugin process but are not a cross-process or filesystem lock.
 - `postal_interrupt` interrupts a session; `postal_close` deletes another
-  session and disconnects its peers. Both are restricted to the session that
-  spawned the target (direct parent). `allowAncestorCommands: true` permits any
-  ancestor. On parent close, `orphanPolicy` controls children: `reparent`
-  (default; notifies the grandparent with `kind: system`), `terminate` (deletes
-  the subtree), or `detach` (orphans have no manager). `postal_status` shows
-  `SESSION_PARENT`. A manually created session has no parent, so agents cannot
-  close it.
+  session and disconnects its peers. Both require an active `interrupt` /
+  `close` grant. Default spawn grants give both to the parent; a paired peer
+  only gets `send`. On parent close, `orphanPolicy` controls children:
+  `reparent` (default; notifies the grandparent with `kind: system`),
+  `terminate` (deletes the subtree), or `detach` (orphans have no manager).
+  `postal_status` shows `SESSION_PARENT`. A manually created session has no
+  default authority grants.
+- `postal_grant` / `postal_revoke` / `postal_relations` manage per-operation
+  authority. `send` is bidirectional; `task`, `spawn`, `interrupt`, `close`,
+  and `approve` must form a DAG. `postal_tree` shows the hierarchy and grants.
+- Delivery modes: `postal_delivery({ to, mode })` sets `interrupt` (default,
+  steer), `idle` (steer only when presence is idle), or `inbox` (queue with
+  `resume: false`; drains on the next turn).
+- `kind: "request"` is collaborative and needs `send`; `kind: "assignment"`
+  is forced and needs `task`; `kind: "task"` remains the legacy assignment alias.
 - `postal_broadcast` sends to every peer with per-peer outbox and rally
   accounting. Pass `msg_id` for idempotent retries.
 

@@ -10,7 +10,11 @@ sequenceDiagram
   A->>T: postal_send letter
   T->>K: write pending record (sender-scoped)
   T->>T: sign letter (HMAC)
-  T->>B: attempt steer
+  T->>T: check send/task grant
+  alt grant inactive
+    T->>K: mark revoked
+  else grant active
+    T->>B: attempt steer
   alt delivery succeeds
     T->>K: mark delivered
     B->>T: prompt admission hook
@@ -35,4 +39,5 @@ sequenceDiagram
         R->>K: mark failed
       end
     end
+  end
   end
