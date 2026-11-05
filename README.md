@@ -281,9 +281,11 @@ An approval is bound to one operation payload: `operation`, `resource`, and
 sorted `parameters`, hashed with sha256. `postal_request_approval` creates a
 pending record (default 15 minutes, clamped to 1 minute–24 hours).
 `postal_approve` / `postal_reject` require the proposer's parent/owner or an
-`approve` grant holder; the proposer cannot approve its own request. One
+`approve` grant holder; the proposer cannot approve its own request unless it
+is a root session with no parent (so manual roots are not stranded). One
 approval authorizes one execution, and a hash or executor mismatch fails
-closed.
+closed. `postal_approvals` lists the caller's records plus pending requests it
+may approve.
 
 When a relation's `close` or `interrupt` rule has `approvalRequired` (the
 spawn-parent defaults do), `postal_close` / `postal_interrupt` need a matching

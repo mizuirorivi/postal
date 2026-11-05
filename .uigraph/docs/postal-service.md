@@ -102,7 +102,8 @@ and the prompt hook ignores them, so they are not forwarded again.
   sha256 over `operation`, `resource`, and sorted `parameters` (default 15
   minutes, clamped to 1 minute–24 hours). The proposer's parent/owner or an
   `approve` grant holder calls `postal_approve` / `postal_reject`; the proposer
-  cannot self-approve. `postal_consume_approval` checks the hash and executor,
+  cannot self-approve unless it is a root session with no parent.
+  `postal_consume_approval` checks the hash and executor,
   then marks the record `consumed`; one approval authorizes one execution.
   `postal_close` / `postal_interrupt` consume a matching approval when the
   relation's rule has `approvalRequired` (spawn-parent defaults do). With

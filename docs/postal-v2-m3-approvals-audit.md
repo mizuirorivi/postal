@@ -207,6 +207,11 @@ M1/M2 lock and index patterns.
   while B consults A, but A's close needs an approval from A's parent).
 - `enforceApprovals: false` keeps advisory mode for deployments that want the
   record without blocking close/interrupt.
+- A root session (no current parent or spawn owner) may approve its own request;
+  without this exception a manual root could never satisfy an approval-gated
+  close/interrupt. Spawned sessions still require a parent/owner or an
+  `approve` grant holder, and `postal_approvals` shows pending requests the
+  caller may decide.
 - Full suite after M3: **178 pass / 0 fail / 588 assertions**.
 - Residual: `host.shell` / `host.edit` / `host.deploy` have no guarded-tool
   integration in this repository; Postal records and displays them as

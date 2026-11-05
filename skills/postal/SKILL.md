@@ -130,7 +130,10 @@ malicious tasks; permissions remain the real boundary.
 - Approvals are bound to `operation`, `resource`, and sorted `parameters` by a
   sha256 hash. `postal_request_approval` creates a pending record (default 15
   minutes). The proposer's parent/owner or an `approve` grant holder calls
-  `postal_approve` / `postal_reject`; the proposer cannot self-approve.
+  `postal_approve` / `postal_reject`; the proposer cannot self-approve, except
+  for a root session with no parent (so manual roots are not stranded).
+  `postal_approvals` lists the caller's records plus pending requests it may
+  approve.
   `postal_consume_approval` checks the hash and executor and marks the record
   `consumed`; one approval authorizes one execution. `postal_audit` lists
   grant, revoke, delivery, task, and approval decisions. `host.*` operations
