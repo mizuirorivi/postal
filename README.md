@@ -356,7 +356,9 @@ new session · ID assigned on first message
 Use `Postal: New session` when you want a real ID and name before typing: the
 command creates the session immediately, asks for an optional name, and opens
 it in a new tab. `Postal: Close session` can then close just that tab or delete
-the session (and all of its postal peers).
+the session and disconnect its postal peers. The TUI delete path does not apply
+`orphanPolicy`; use `postal_close` when children must be reparented, terminated,
+or detached by policy.
 
 When the current session has connected peers, the footer appends them and
 colors just that segment green, for example:

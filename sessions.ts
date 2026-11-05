@@ -217,7 +217,7 @@ export async function closeSession(
       context.ui.toast.show({ title: "Postal", message: `Delete failed: ${error}`, variant: "error" })
       return { ok: false, error }
     }
-    await disconnectPeers(context, sessionID)
+    // Delete first: if removal fails, keep the peer records untouched.
     try {
       await remove({ sessionID })
     } catch (error) {
@@ -225,6 +225,7 @@ export async function closeSession(
       context.ui.toast.show({ title: "Postal", message: `Delete failed: ${message}`, variant: "error" })
       return { ok: false, error: message }
     }
+    await disconnectPeers(context, sessionID)
     closeTab(context, sessionID)
     if (isCurrent) navigate(context, { type: "home" })
     context.ui.toast.show({ title: "Postal", message: `Deleted session: ${label}`, variant: "success" })
@@ -273,7 +274,7 @@ export async function closeSessionCommand(
     if (typeof dialog.confirm === "function") {
       const confirmed = await dialog.confirm({
         title: "Postal: Delete session",
-        message: `Delete "${label}" permanently? Child sessions are deleted too.`,
+        message: `Delete "${label}" permanently? Postal peers are disconnected.`,
         label: { confirm: "Delete", cancel: "Cancel" },
       })
       if (!confirmed) return { ok: false, cancelled: true }

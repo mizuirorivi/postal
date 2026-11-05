@@ -344,6 +344,7 @@ describe("closeSession", () => {
     })
 
     expect(result).toEqual({ ok: false, error: "delete failed" })
+    expect(calls.disconnect).toEqual([])
     expect(calls.close).toEqual([])
     expect(calls.navigate).toEqual([])
     expect(lastToast(calls)).toMatchObject({ variant: "error" })
