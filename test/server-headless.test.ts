@@ -895,3 +895,68 @@ describe("HMAC Phase 1", () => {
     expect((newEvent.metadata as any).postal.reason).toBeUndefined()
   })
 })
+
+describe("watchdog and outbox cleanup", () => {
+  it("nudges an idle worker with an unacked task", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.rpc.presence({ sessions: [{ id: "ses_b", title: "B", state: "idle", pending: [] }] })
+    await test.tools.send.execute(
+      { to: "ses_b", text: "do the task", kind: "task", task_id: "T1", msg_id: "msg_task" },
+      { sessionID: "ses_a" },
+    )
+
+    const result = await test.tools.watchdog.execute({ afterSeconds: 0 }, { sessionID: "ses_a" })
+
+    expect(result.content).toContain("msg_task")
+    expect(result.content).toContain("NUDGED\tmsg_task")
+    const nudge = test.prompts.at(-1)!
+    expect(nudge.sessionID).toBe("ses_b")
+    expect(nudge.metadata?.postal?.kind).toBe("system")
+    expect(nudge.metadata?.postal?.replyTo).toBe("msg_task")
+    expect(nudge.text).toContain("Watchdog")
+    const record = test.storage.get("outbox/msg_task") as any
+    expect(record.nudges).toBe(1)
+  })
+
+  it("does not nudge a running worker", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.rpc.presence({ sessions: [{ id: "ses_b", title: "B", state: "running", pending: [] }] })
+    await test.tools.send.execute(
+      { to: "ses_b", text: "do the task", kind: "task", task_id: "T1", msg_id: "msg_task_running" },
+      { sessionID: "ses_a" },
+    )
+
+    const result = await test.tools.watchdog.execute({ afterSeconds: 0 }, { sessionID: "ses_a" })
+
+    expect(result.content).toContain("NUDGED\t-")
+    expect(test.prompts).toHaveLength(1)
+  })
+
+  it("cleans expired outbox records only when dryRun is false", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.tools.send.execute({ to: "ses_b", text: "old letter", msg_id: "msg_old_outbox" }, { sessionID: "ses_a" })
+    const record = test.storage.get("outbox/msg_old_outbox") as any
+    record.createdAt = Date.now() - 8 * 24 * 60 * 60 * 1000
+    test.storage.set("outbox/msg_old_outbox", record)
+
+    const dry = await test.tools.cleanup.execute({ dryRun: true }, { sessionID: "ses_a" })
+    expect(dry.content).toContain("CLEANUP_DRY_RUN")
+    expect(dry.content).toContain("COUNT\t1")
+    expect(test.storage.has("outbox/msg_old_outbox")).toBe(true)
+
+    const removed = await test.tools.cleanup.execute({ dryRun: false }, { sessionID: "ses_a" })
+    expect(removed.content).toContain("CLEANUP_REMOVED")
+    expect(removed.content).toContain("COUNT\t1")
+    expect(test.storage.has("outbox/msg_old_outbox")).toBe(false)
+    expect((await test.tools.inbox.execute({}, { sessionID: "ses_a" })).content).not.toContain("msg_old_outbox")
+  })
+})

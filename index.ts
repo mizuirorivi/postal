@@ -166,6 +166,8 @@ type OutboxRecord = {
   lastError?: string
   ackedAt?: number
   queuedForWindow?: boolean
+  nudges?: number
+  lastNudgeAt?: number
 }
 
 const MENTION = /@(ses_[A-Za-z0-9_-]+)/g
@@ -531,6 +533,29 @@ async function verifyLetter(
   return { ok: true }
 }
 
+function watchdogAfterMs(ctx: PostalContext): number {
+  const configured = Number(ctx.options?.watchdogAfterSeconds)
+  const seconds = Number.isFinite(configured) && configured >= 0 ? configured : 300
+  return Math.max(0, Math.min(86_400, seconds)) * 1000
+}
+
+function watchdogIntervalMs(ctx: PostalContext): number {
+  const configured = Number(ctx.options?.watchdogIntervalSeconds)
+  const seconds = Number.isFinite(configured) && configured > 0 ? configured : 600
+  return Math.max(30, Math.min(86_400, seconds)) * 1000
+}
+
+function watchdogMaxNudges(ctx: PostalContext): number {
+  const configured = Number(ctx.options?.watchdogMaxNudges)
+  return Number.isFinite(configured) && configured > 0 ? Math.max(1, Math.min(10, Math.floor(configured))) : 2
+}
+
+function outboxTtlMs(ctx: PostalContext): number {
+  const configured = Number(ctx.options?.outboxTtlDays)
+  const days = Number.isFinite(configured) && configured > 0 ? configured : 7
+  return Math.max(1, Math.min(90, days)) * 24 * 60 * 60 * 1000
+}
+
 async function isAncestorOf(ctx: PostalContext, actor: string, target: string): Promise<boolean> {
   let current = target
   for (let depth = 0; depth < 16; depth += 1) {
@@ -692,6 +717,7 @@ async function rallyRemaining(
 const OUTBOX_INDEX = "outbox/index"
 const outboxLocks = new Map<string, Promise<unknown>>()
 let outboxTimer: ReturnType<typeof setInterval> | undefined
+let lastOutboxCleanupAt = 0
 const MAX_OUTBOX_ATTEMPTS = 6
 const RETRY_INTERVAL_MS = 15_000
 
@@ -884,6 +910,83 @@ async function retryOutbox(ctx: PostalContext): Promise<void> {
       await attemptOutbox(ctx, record)
     }
   })
+}
+
+/** Nudge idle workers that still have an unacked task letter. */
+async function runWatchdog(
+  ctx: PostalContext,
+  options: { dryRun?: boolean; afterSeconds?: number; nudgeUnknown?: boolean } = {},
+): Promise<{ candidates: OutboxRecord[]; nudged: string[] }> {
+  const afterMs =
+    typeof options.afterSeconds === "number" && options.afterSeconds >= 0
+      ? options.afterSeconds * 1000
+      : watchdogAfterMs(ctx)
+  const intervalMs = watchdogIntervalMs(ctx)
+  const maxNudges = watchdogMaxNudges(ctx)
+  const nudgeUnknown = options.nudgeUnknown === true || ctx.options?.watchdogNudgeUnknown === true
+  const now = Date.now()
+  const records = await listOutbox(ctx)
+  const candidates = records.filter(
+    (record) =>
+      record.status === "delivered" &&
+      record.envelope.kind === "task" &&
+      now - record.createdAt >= afterMs &&
+      (record.nudges ?? 0) < maxNudges &&
+      (!record.lastNudgeAt || now - record.lastNudgeAt >= intervalMs),
+  )
+  const nudged: string[] = []
+  if (options.dryRun) return { candidates, nudged }
+
+  for (const record of candidates) {
+    const presence = await readPresence(ctx, record.to)
+    const state = presence?.state ?? "unknown"
+    if (state !== "idle" && !(state === "unknown" && nudgeUnknown)) continue
+    const task = record.envelope.taskID ? `task ${record.envelope.taskID}` : `message ${record.msgID}`
+    const result = await dispatchLetter(ctx, {
+      from: record.from,
+      to: record.to,
+      body:
+        `Watchdog: ${task} is still open and the worker appears ${state}. ` +
+        `Please report status or complete it. Reply with postal_send and pass reply_to: ${record.msgID}.`,
+      envelope: {
+        kind: "system",
+        taskID: record.envelope.taskID,
+        replyTo: record.msgID,
+        msgID: generateMsgID(),
+        artifacts: [],
+        commands: [],
+      },
+      queueOnLimit: true,
+    })
+    if (result.status !== "failed" && result.status !== "rally-limit") {
+      record.nudges = (record.nudges ?? 0) + 1
+      record.lastNudgeAt = now
+      await updateOutbox(ctx, record)
+      nudged.push(record.msgID)
+    }
+  }
+  return { candidates, nudged }
+}
+
+/** Remove old delivered/acked/failed outbox records; msg markers stay for idempotency. */
+async function cleanupOutbox(ctx: PostalContext, options: { dryRun?: boolean } = {}): Promise<OutboxRecord[]> {
+  const ttl = outboxTtlMs(ctx)
+  const now = Date.now()
+  const records = await listOutbox(ctx)
+  const expired = records.filter(
+    (record) =>
+      (record.status === "delivered" || record.status === "acked" || record.status === "failed") &&
+      now - record.createdAt > ttl,
+  )
+  if (options.dryRun || expired.length === 0) return expired
+  const ids = new Set(expired.map((record) => record.msgID))
+  for (const msgID of ids) await ctx.storage.remove(`outbox/${msgID}`)
+  await serialized(outboxLocks, "index", async () => {
+    const index = await readOutboxIndex(ctx)
+    const next = index.filter((msgID) => !ids.has(msgID))
+    await writeOutboxIndex(ctx, next)
+  })
+  return expired
 }
 
 /**
@@ -1804,6 +1907,69 @@ async function setup(ctx: PostalContext): Promise<void> {
     })
 
     editor.add({
+      name: "watchdog",
+      description:
+        "Find delivered task letters that are still unacked and nudge idle workers with a system letter. " +
+        "Use dryRun to inspect candidates without sending.",
+      input: {
+        type: "object",
+        properties: {
+          dryRun: { type: "boolean" },
+          afterSeconds: { type: "number", description: "Override the minimum task age for this run" },
+          nudgeUnknown: { type: "boolean", description: "Nudge workers whose presence is unknown" },
+        },
+        additionalProperties: false,
+      },
+      execute: async (input, context) => {
+        const value = input as { dryRun?: boolean; afterSeconds?: number; nudgeUnknown?: boolean }
+        const result = await runWatchdog(ctx, value)
+        const rows = result.candidates.map((record) => {
+          const age = Math.max(0, Math.floor((Date.now() - record.createdAt) / 1000))
+          return [
+            record.msgID,
+            record.to,
+            record.envelope.taskID ?? "-",
+            age,
+            record.nudges ?? 0,
+          ].join("\t")
+        })
+        return {
+          content: [
+            value.dryRun ? "WATCHDOG_DRY_RUN" : "WATCHDOG_RUN",
+            "CANDIDATE_MSG_ID\tTO\tTASK_ID\tAGE_SECONDS\tNUDGES",
+            ...(rows.length > 0 ? rows : ["(none)"]),
+            `NUDGED\t${result.nudged.length > 0 ? result.nudged.join(",") : "-"}`,
+          ].join("\n"),
+        }
+      },
+    })
+
+    editor.add({
+      name: "cleanup",
+      description:
+        "Remove delivered/acked/failed outbox records older than outboxTtlDays. " +
+        "Defaults to a dry run; pass dryRun: false to delete.",
+      input: {
+        type: "object",
+        properties: {
+          dryRun: { type: "boolean" },
+        },
+        additionalProperties: false,
+      },
+      execute: async (input, context) => {
+        const dryRun = (input as { dryRun?: boolean }).dryRun !== false
+        const expired = await cleanupOutbox(ctx, { dryRun })
+        return {
+          content: [
+            dryRun ? "CLEANUP_DRY_RUN" : "CLEANUP_REMOVED",
+            `COUNT\t${expired.length}`,
+            ...expired.map((record) => `${record.msgID}\t${record.to}\t${record.status}\t${record.envelope.kind}`),
+          ].join("\n"),
+        }
+      },
+    })
+
+    editor.add({
       name: "interrupt",
       description: "Interrupt a running session. Defaults to this session.",
       input: {
@@ -1882,6 +2048,11 @@ async function setup(ctx: PostalContext): Promise<void> {
     if (outboxTimer) clearInterval(outboxTimer)
     outboxTimer = setInterval(() => {
       void retryOutbox(ctx)
+      void runWatchdog(ctx)
+      if (Date.now() - lastOutboxCleanupAt > 60 * 60 * 1000) {
+        lastOutboxCleanupAt = Date.now()
+        void cleanupOutbox(ctx)
+      }
     }, RETRY_INTERVAL_MS)
     outboxTimer.unref?.()
   } catch {

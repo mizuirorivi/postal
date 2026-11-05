@@ -70,6 +70,16 @@ pending-inbox metadata (item ID, type, source only). Presence is published by
 the TUI, expires after 30 seconds, and is `unknown` for headless sessions.
 Use `postal_log` for recent `[postal]` messages from a transcript.
 
+## Watchdog and cleanup
+
+- `postal_watchdog` finds delivered `kind: "task"` letters that are still
+  unacked and nudges idle workers with `kind: "system"`. Use `dryRun` to inspect
+  candidates. Running workers are skipped; unknown presence needs
+  `nudgeUnknown`. Defaults: 300s age, 600s interval, 2 nudges.
+- `postal_cleanup` removes old delivered/acked/failed outbox records
+  (`outboxTtlDays`, default 7). It is a dry run unless `dryRun: false` is passed.
+  Idempotency `msg` markers remain.
+
 ## HMAC Phase 1
 
 Pairing creates a per-pair HMAC-SHA256 key (same location only). Every letter is

@@ -33,6 +33,7 @@ its own model, agent, permissions, and tab.
 - Persistent outbox with retry + ACK (`postal_inbox`, `postal_resend`)
 - Advisory claims (`postal_claim` / `postal_release`)
 - Agent lifecycle (`postal_interrupt`, `postal_close`) with a spawn-parent allowlist, and `postal_broadcast`
+- Idle-worker watchdog nudges and outbox TTL cleanup
 - Multiple connected peers per session
 - Ctrl+P commands: new session, connect, close session, disconnect peers, show
   connected peers, reset rally
@@ -227,6 +228,19 @@ verifies before the AI sees it:
 Manual root sessions have no parent, so agents cannot send them `kind: "task"`
 letters. This is intentional least privilege.
 
+### Watchdog and cleanup
+
+`postal_watchdog` finds `kind: "task"` letters that were delivered but never
+acked. If the worker's TUI presence says `idle`, it sends one `kind: "system"`
+nudge that asks for a status or completion and references the original
+`msg_id`. It does not nudge running workers; unknown presence is skipped unless
+`nudgeUnknown` is passed. Defaults: 300s minimum age, 600s between nudges, max
+2 nudges per task. Use `dryRun` to inspect candidates.
+
+`postal_cleanup` removes delivered/acked/failed outbox records older than
+`outboxTtlDays` (default 7). It defaults to a dry run; pass `dryRun: false` to
+delete. `msg/<id>` idempotency markers are retained.
+
 ### Claims and lifecycle
 
 `postal_claim({ scope, ttl })` takes an advisory lock for a path or task.
@@ -250,7 +264,11 @@ and rally accounting.
 
 - **Outbox storage** is the plugin KV table. It is per-location, not a global
   distributed queue; cross-project delivery still relies on the target being
-  reachable.
+  reachable. TTL cleanup removes old records but keeps `msg` markers for
+  idempotency.
+- **Watchdog** only nudges sessions whose TUI presence is `idle`; headless
+  workers stay `unknown` and need `nudgeUnknown` or external supervision.
+  Nudges start a worker turn and therefore cost tokens.
 - **ACK** is application-level: the receiver must include `reply_to: msg_id`.
   There is no transport-level acknowledgement from the model runtime.
 - **Claims** are advisory; a rogue worker can ignore them. Filesystem
@@ -363,7 +381,11 @@ Pass plugin options with the object form:
         "allowAncestorCommands": false,
         "orphanPolicy": "reparent",
         "hmacWindowSeconds": 120,
-        "keyGraceHours": 24
+        "keyGraceHours": 24,
+        "watchdogAfterSeconds": 300,
+        "watchdogIntervalSeconds": 600,
+        "watchdogMaxNudges": 2,
+        "outboxTtlDays": 7
       }
     }
   ]
@@ -376,6 +398,8 @@ Pass plugin options with the object form:
 default is direct-parent only. `orphanPolicy` is `reparent` (default),
 `terminate`, or `detach`. `hmacWindowSeconds` (default 120) bounds signature
 age; `keyGraceHours` (default 24) keeps a rotated key valid for verification.
+`watchdogAfterSeconds` (300), `watchdogIntervalSeconds` (600), and
+`watchdogMaxNudges` (2) tune nudges; `outboxTtlDays` (7) bounds outbox retention.
 
 ## Security model
 

@@ -14,8 +14,8 @@ the TypeScript sources directly.
 - registers the `postal` RPC contract: `connect`, `disconnect`, `status`, `presence`
 - registers the bundled agent skill from `skills/postal/SKILL.md`
 - registers the `postal_*` tools for directory lookup, peer listing, sending,
-  broadcast, outbox inspection, retry, claims, spawn, interrupt, close, and
-  HMAC key rotation
+  broadcast, outbox inspection, retry, claims, spawn, interrupt, close,
+  HMAC key rotation, watchdog scanning, and outbox cleanup
 - starts a 15-second outbox retry scanner
 - installs the prompt hook for `@ses_` mentions, HMAC verification, task
   authorization, relay ACK marking, and the TUI connect/disconnect/reset
@@ -75,6 +75,13 @@ and the prompt hook ignores them, so they are not forwarded again.
   `keyGraceHours` (default 24). Keys are same-location only in Phase 1.
 - **Broadcast.** Each peer gets its own outbox record and rally accounting, with
   a per-peer suffix on the idempotency key.
+- **Watchdog.** Delivered `kind: "task"` records that remain unacked are checked
+  against TUI presence. Idle workers receive a `kind: "system"` nudge with the
+  original `reply_to`; running workers are skipped. Defaults: 300s age, 600s
+  between nudges, 2 nudges. Unknown presence is skipped unless explicitly
+  allowed.
+- **Outbox cleanup.** Delivered/acked/failed records older than
+  `outboxTtlDays` (default 7) are removed; `msg` idempotency markers remain.
 
 ## Pairing, spawning, and lifecycle
 
@@ -109,13 +116,18 @@ Plugin options are read from the plugin entry in `opencode.json(c)`:
 | `orphanPolicy` | `reparent` | Child handling when a parent closes |
 | `hmacWindowSeconds` | 120 | Accepted `issued_at` skew (30–3600) |
 | `keyGraceHours` | 24 | Old-key verification grace after `postal_rekey` (1–168) |
+| `watchdogAfterSeconds` | 300 | Minimum age of an unacked task before a nudge |
+| `watchdogIntervalSeconds` | 600 | Minimum time between nudges for one task |
+| `watchdogMaxNudges` | 2 | Maximum nudges per task |
+| `outboxTtlDays` | 7 | Retention for delivered/acked/failed outbox records |
 
 ## Operational limits
 
 - Outbox state lives in the per-location plugin KV table. It is not a global
   distributed queue; cross-project delivery still needs a reachable target.
 - ACK depends on the receiver passing `reply_to`; there is no runtime-level
-  acknowledgement.
+  acknowledgement. Watchdog only sees idle sessions through TUI presence;
+  headless workers remain `unknown`. Nudges wake the worker and cost tokens.
 - Claims are advisory and can be ignored; filesystem permissions remain the real
   enforcement boundary.
 - `postal_status` reports peers, rally budget, last letter, outbox count, and the
