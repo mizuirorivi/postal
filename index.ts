@@ -46,17 +46,31 @@ import {
   listGrants,
   OPERATION_SPECS,
   OPERATIONS,
+  readCurrentParent,
   readSpawnFact,
   revokeOperations,
   setDelivery,
   wouldCreateParentCycle,
   writeSpawnFact,
   type DeliveryMode,
+  type GrantRule,
   type Lock,
   type Operation,
   type RelationGrant,
 } from "./grants.js"
 import { answerQuestion } from "./question-answer.js"
+import { appendAudit, listAudit } from "./audit.js"
+import {
+  APPROVAL_OPERATIONS,
+  approvalOperationSpec,
+  approveApproval,
+  consumeApproval,
+  createApproval,
+  listApprovals,
+  readApproval,
+  rejectApproval,
+  type ApprovalOperation,
+} from "./approvals.js"
 import {
   forwardQuestion,
   handleFormCancelled,
@@ -465,15 +479,49 @@ async function canInspect(ctx: PostalContext, actor: string, target: string): Pr
 }
 
 /** A session may interrupt/close itself or a session that granted it that operation. */
-async function canOperate(
+async function operationRule(
   ctx: PostalContext,
   actor: string,
   target: string,
   operation: "interrupt" | "close",
-): Promise<boolean> {
-  if (actor === target) return true
+): Promise<GrantRule | undefined> {
+  if (actor === target) return { allowed: true, approvalRequired: false }
   const grant = await ensureGrant(ctx, stateLock(ctx), actor, target)
-  return Boolean(grant && isRuleActive(grant.operations[operation], operation))
+  if (!grant || !isRuleActive(grant.operations[operation], operation)) return undefined
+  return grant.operations[operation]
+}
+
+/**
+ * Authorize an enforced operation. When the relation marks it approval-backed,
+ * a matching approval must be consumed before the action runs; missing or
+ * mismatched approvals fail closed. `enforceApprovals: false` keeps advisory
+ * mode for deployments that only want the record.
+ */
+async function enforceApproval(
+  ctx: PostalContext,
+  actor: string,
+  target: string,
+  operation: "interrupt" | "close",
+  approvalID: string | undefined,
+): Promise<string | undefined> {
+  const rule = await operationRule(ctx, actor, target, operation)
+  if (!rule) return `not authorized; the target has not granted ${operation} to this session`
+  if (!rule.approvalRequired || ctx.options?.enforceApprovals === false) return undefined
+  if (!approvalID) {
+    return `approval required for ${operation} on ${target}; create one with postal_request_approval and retry with approval_id`
+  }
+  try {
+    await consumeApproval(ctx, stateLock(ctx), approvalID, {
+      executor: actor,
+      operation,
+      resource: target,
+      parameters: {},
+    })
+    await recordAudit(ctx, actor, "approval_consume", approvalID, { operation, resource: target })
+    return undefined
+  } catch (error) {
+    return `approval rejected: ${errorText(error)}`
+  }
 }
 
 /** Check whether actor is the direct parent of target, or an ancestor when enabled. */
@@ -1730,10 +1778,47 @@ async function grantFromSession(
   }
   try {
     const grant = await grantOperations(ctx, stateLock(ctx), sessionID, to, operations, options)
+    await recordAudit(ctx, sessionID, "grant", to, {
+      operations,
+      approvalRequired: options.approvalRequired ?? null,
+      expiresAt: options.expiresAt ?? null,
+    })
     return { ok: true, grant }
   } catch (error) {
     return { ok: false, error: errorText(error) }
   }
+}
+
+/** Audit failures must never block the operation they describe. */
+async function recordAudit(
+  ctx: PostalContext,
+  actor: string,
+  action: string,
+  target: string,
+  after?: unknown,
+  note?: string,
+): Promise<void> {
+  try {
+    await appendAudit(ctx, stateLock(ctx), {
+      actor,
+      action,
+      target,
+      ...(after !== undefined ? { after } : {}),
+      ...(note ? { note } : {}),
+    })
+  } catch (error) {
+    console.warn(`postal: audit write failed: ${errorText(error)}`)
+  }
+}
+
+/** The proposer's parent/owner or an explicit approve grant holder may decide. */
+async function canApprove(ctx: PostalContext, actor: string, proposer: string): Promise<boolean> {
+  if (!actor || actor === proposer) return false
+  if ((await readCurrentParent(ctx, proposer)) === actor) return true
+  const spawn = await readSpawnFact(ctx, proposer)
+  if (spawn?.spawnedBy === actor) return true
+  const grant = await ensureGrant(ctx, stateLock(ctx), proposer, actor)
+  return Boolean(grant && isRuleActive(grant.operations.approve, "approve"))
 }
 
 /** Disconnect one peer, or every peer when peerID is omitted. */
@@ -2148,6 +2233,7 @@ async function setup(ctx: PostalContext): Promise<void | (() => void)> {
         }
         try {
           const grant = await setDelivery(ctx, stateLock(ctx), context.sessionID, to, value.mode)
+          await recordAudit(ctx, context.sessionID, "delivery", to, { mode: grant.delivery })
           return { content: `DELIVERY\t${to}\t${grant.delivery}` }
         } catch (error) {
           return { content: `postal: delivery failed: ${errorText(error)}` }
@@ -2206,6 +2292,11 @@ async function setup(ctx: PostalContext): Promise<void | (() => void)> {
             revoked.push(record.msgID)
           }
         }
+        await recordAudit(ctx, context.sessionID, "revoke", to, {
+          operations: operations ?? "all",
+          revoked,
+          cancelled,
+        })
         return {
           content: [
             `postal: revoked ${operations?.join(",") ?? "all"} for ${to}`,
@@ -2264,6 +2355,11 @@ async function setup(ctx: PostalContext): Promise<void | (() => void)> {
           value.status as TaskStatus,
           value.note,
         )
+        await recordAudit(ctx, context.sessionID, "task", chosen.taskID, {
+          from: chosen.from,
+          status: updated.status,
+          note: value.note ?? null,
+        })
         return {
           content: [
             `TASK_ID\t${updated.taskID}`,
@@ -2355,6 +2451,284 @@ async function setup(ctx: PostalContext): Promise<void | (() => void)> {
             `SPAWNED_BY\t${spawn?.spawnedBy ?? "-"}`,
             "DIRECTION\tPEER\tOPERATIONS\tENFORCEABLE\tAPPROVAL_REQUIRED\tEXPIRES\tDELIVERY\tSTATE",
             ...(rows.length > 0 ? rows : ["(no grants)"]),
+            "OPERATION\tENFORCEABLE\tDEFAULT_APPROVAL\tNOTE",
+            ...APPROVAL_OPERATIONS.map((operation) => {
+              const spec = approvalOperationSpec(operation)
+              return [
+                operation,
+                spec?.enforceable ?? "none",
+                spec?.defaultApprovalRequired ? "yes" : "no",
+                spec?.enforceable === "postal"
+                  ? ""
+                  : "approval required but not enforceable by Postal",
+              ].join("\t")
+            }),
+          ].join("\n"),
+        }
+      },
+    })
+
+    editor.add({
+      name: "request_approval",
+      description:
+        "Create an operation-bound approval request. The approval is bound by hash to the operation, " +
+        "resource, and parameters, and expires automatically.",
+      input: {
+        type: "object",
+        properties: {
+          operation: { type: "string", enum: [...APPROVAL_OPERATIONS] },
+          resource: { type: "string", description: "Session ID, path, command, or deployment target" },
+          parameters: { type: "object", additionalProperties: true },
+          expiresAt: { type: "number", description: "Epoch milliseconds (1 minute to 24 hours)" },
+        },
+        required: ["operation", "resource"],
+        additionalProperties: false,
+      },
+      execute: async (input, context) => {
+        const value = input as {
+          operation?: string
+          resource?: string
+          parameters?: unknown
+          expiresAt?: number
+        }
+        const operation = typeof value.operation === "string" ? value.operation.trim() : ""
+        const spec = approvalOperationSpec(operation)
+        if (!spec) return { content: `postal: unknown approval operation: ${operation || "(missing)"}` }
+        const resource = typeof value.resource === "string" ? value.resource : ""
+        const parameters =
+          value.parameters && typeof value.parameters === "object" && !Array.isArray(value.parameters)
+            ? (value.parameters as Record<string, unknown>)
+            : {}
+        try {
+          const record = await createApproval(ctx, stateLock(ctx), {
+            proposer: context.sessionID,
+            operation,
+            resource,
+            parameters,
+            ...(typeof value.expiresAt === "number" ? { expiresAt: value.expiresAt } : {}),
+          })
+          await recordAudit(ctx, context.sessionID, "approval_request", record.approvalID, {
+            operation: record.operation,
+            resource: record.resource,
+            hash: record.resourceHash,
+          })
+          return {
+            content: [
+              `APPROVAL_ID\t${record.approvalID}`,
+              `OPERATION\t${record.operation}`,
+              `RESOURCE\t${record.resource}`,
+              `HASH\t${record.resourceHash}`,
+              `STATUS\t${record.status}`,
+              `EXPIRES_AT\t${new Date(record.expiresAt).toISOString()}`,
+              `ENFORCEABLE\t${spec.enforceable}`,
+              ...(spec.enforceable === "postal" ? [] : ["NOTE\tapproval required but not enforceable by Postal"]),
+            ].join("\n"),
+          }
+        } catch (error) {
+          return { content: `postal: approval request failed: ${errorText(error)}` }
+        }
+      },
+    })
+
+    editor.add({
+      name: "approve",
+      description: "Approve a pending operation-bound approval request.",
+      input: {
+        type: "object",
+        properties: {
+          approval_id: { type: "string" },
+          executor: { type: "string", description: "Optional session bound to execute the approval" },
+        },
+        required: ["approval_id"],
+        additionalProperties: false,
+      },
+      execute: async (input, context) => {
+        const value = input as { approval_id?: string; executor?: string }
+        const approvalID = value.approval_id?.trim()
+        if (!approvalID) return { content: "postal: 'approval_id' is required" }
+        const record = await readApproval(ctx, approvalID)
+        if (!record) return { content: `postal: approval not found: ${approvalID}` }
+        if (!(await canApprove(ctx, context.sessionID, record.proposer))) {
+          return { content: "postal: not authorized to approve this request" }
+        }
+        try {
+          const approved = await approveApproval(ctx, stateLock(ctx), approvalID, context.sessionID, {
+            ...(value.executor?.trim() ? { executor: value.executor.trim() } : {}),
+          })
+          await recordAudit(ctx, context.sessionID, "approval_approve", approved.approvalID, {
+            proposer: approved.proposer,
+            executor: approved.executor ?? null,
+          })
+          return {
+            content: [
+              `APPROVED\t${approved.approvalID}`,
+              `PROPOSER\t${approved.proposer}`,
+              `APPROVER\t${approved.approver}`,
+              `EXECUTOR\t${approved.executor ?? "-"}`,
+              `EXPIRES_AT\t${new Date(approved.expiresAt).toISOString()}`,
+            ].join("\n"),
+          }
+        } catch (error) {
+          return { content: `postal: approve failed: ${errorText(error)}` }
+        }
+      },
+    })
+
+    editor.add({
+      name: "reject",
+      description: "Reject a pending operation-bound approval request.",
+      input: {
+        type: "object",
+        properties: {
+          approval_id: { type: "string" },
+          reason: { type: "string" },
+        },
+        required: ["approval_id"],
+        additionalProperties: false,
+      },
+      execute: async (input, context) => {
+        const value = input as { approval_id?: string; reason?: string }
+        const approvalID = value.approval_id?.trim()
+        if (!approvalID) return { content: "postal: 'approval_id' is required" }
+        const record = await readApproval(ctx, approvalID)
+        if (!record) return { content: `postal: approval not found: ${approvalID}` }
+        if (!(await canApprove(ctx, context.sessionID, record.proposer))) {
+          return { content: "postal: not authorized to reject this request" }
+        }
+        try {
+          const rejected = await rejectApproval(
+            ctx,
+            stateLock(ctx),
+            approvalID,
+            context.sessionID,
+            value.reason?.trim(),
+          )
+          await recordAudit(ctx, context.sessionID, "approval_reject", rejected.approvalID, {
+            proposer: rejected.proposer,
+            reason: rejected.reason ?? null,
+          })
+          return { content: `postal: rejected ${rejected.approvalID}${rejected.reason ? `: ${rejected.reason}` : ""}` }
+        } catch (error) {
+          return { content: `postal: reject failed: ${errorText(error)}` }
+        }
+      },
+    })
+
+    editor.add({
+      name: "consume_approval",
+      description:
+        "Consume an approved operation. The caller becomes the executor; the stored operation, resource, " +
+        "parameters, and hash must still match.",
+      input: {
+        type: "object",
+        properties: {
+          approval_id: { type: "string" },
+        },
+        required: ["approval_id"],
+        additionalProperties: false,
+      },
+      execute: async (input, context) => {
+        const approvalID = String((input as { approval_id?: string }).approval_id ?? "").trim()
+        if (!approvalID) return { content: "postal: 'approval_id' is required" }
+        const record = await readApproval(ctx, approvalID)
+        if (!record) return { content: `postal: approval not found: ${approvalID}` }
+        try {
+          const consumed = await consumeApproval(ctx, stateLock(ctx), approvalID, {
+            executor: context.sessionID,
+            operation: record.operation,
+            resource: record.resource,
+            parameters: record.parameters,
+          })
+          await recordAudit(ctx, context.sessionID, "approval_consume", consumed.approvalID, {
+            operation: consumed.operation,
+            resource: consumed.resource,
+          })
+          return { content: `postal: consumed ${consumed.approvalID} for ${consumed.operation} ${consumed.resource}` }
+        } catch (error) {
+          return { content: `postal: consume failed: ${errorText(error)}` }
+        }
+      },
+    })
+
+    editor.add({
+      name: "approvals",
+      description: "List approval requests proposed or decided by the caller.",
+      input: {
+        type: "object",
+        properties: {
+          status: {
+            type: "string",
+            enum: ["pending", "approved", "rejected", "expired", "consumed"],
+          },
+        },
+        additionalProperties: false,
+      },
+      execute: async (input, context) => {
+        const status = (input as { status?: string }).status
+        const approvals = (await listApprovals(ctx)).filter(
+          (record) => record.proposer === context.sessionID || record.approver === context.sessionID,
+        )
+        const filtered = status
+          ? approvals.filter((record) => record.status === status)
+          : approvals
+        if (filtered.length === 0) return { content: "postal: no approvals" }
+        return {
+          content: [
+            "APPROVAL_ID\tOPERATION\tRESOURCE\tSTATUS\tPROPOSER\tAPPROVER\tEXPIRES",
+            ...filtered.map((record) =>
+              [
+                record.approvalID,
+                record.operation,
+                record.resource,
+                record.status,
+                record.proposer,
+                record.approver ?? "-",
+                new Date(record.expiresAt).toISOString(),
+              ].join("\t"),
+            ),
+          ].join("\n"),
+        }
+      },
+    })
+
+    editor.add({
+      name: "audit",
+      description:
+        "Show recent audit records for the caller, or for a target the caller may inspect. " +
+        "Records cover grants, revocations, delivery changes, task state, and approvals.",
+      input: {
+        type: "object",
+        properties: {
+          limit: { type: "number" },
+          action: { type: "string" },
+          target: { type: "string" },
+        },
+        additionalProperties: false,
+      },
+      execute: async (input, context) => {
+        const value = input as { limit?: number; action?: string; target?: string }
+        const target = value.target?.trim()
+        if (target && !(await canInspect(ctx, context.sessionID, target))) {
+          return { content: "postal: not authorized to inspect another session" }
+        }
+        const records = await listAudit(ctx, {
+          ...(typeof value.limit === "number" ? { limit: value.limit } : {}),
+          ...(value.action?.trim() ? { action: value.action.trim() } : {}),
+          ...(target ? { target } : { actor: context.sessionID }),
+        })
+        if (records.length === 0) return { content: "postal: no audit records" }
+        return {
+          content: [
+            "AT\tACTOR\tACTION\tTARGET\tNOTE",
+            ...records.map((record) =>
+              [
+                new Date(record.at).toISOString(),
+                record.actor,
+                record.action,
+                record.target,
+                record.note ?? "-",
+              ].join("\t"),
+            ),
           ].join("\n"),
         }
       },
@@ -3163,6 +3537,7 @@ async function setup(ctx: PostalContext): Promise<void | (() => void)> {
         type: "object",
         properties: {
           sessionID: { type: "string" },
+          approval_id: { type: "string", description: "Required when the relation marks interrupt approval-required" },
         },
         additionalProperties: false,
       },
@@ -3170,16 +3545,17 @@ async function setup(ctx: PostalContext): Promise<void | (() => void)> {
         if (typeof ctx.session.interrupt !== "function") {
           return { content: "postal: interrupting sessions is not supported by this OpenCode version" }
         }
-        const target = String((input as { sessionID?: unknown }).sessionID ?? context.sessionID)
+        const value = input as { sessionID?: string; approval_id?: string }
+        const target = String(value.sessionID ?? context.sessionID)
         if (!target) return { content: "postal: no session to interrupt" }
-        if (target !== context.sessionID) {
-          const allowed = await canOperate(ctx, context.sessionID, target, "interrupt")
-          if (!allowed) {
-            return {
-              content: "postal: not authorized; the target has not granted interrupt to this session",
-            }
-          }
-        }
+        const error = await enforceApproval(
+          ctx,
+          context.sessionID,
+          target,
+          "interrupt",
+          value.approval_id?.trim(),
+        )
+        if (error) return { content: `postal: ${error}` }
         try {
           await ctx.session.interrupt({ sessionID: target })
           return { content: `postal: interrupted ${target}` }
@@ -3196,23 +3572,27 @@ async function setup(ctx: PostalContext): Promise<void | (() => void)> {
         type: "object",
         properties: {
           sessionID: { type: "string" },
+          approval_id: { type: "string", description: "Required when the relation marks close approval-required" },
         },
         required: ["sessionID"],
         additionalProperties: false,
       },
       execute: async (input, context) => {
-        const target = String((input as { sessionID?: unknown }).sessionID ?? "").trim()
+        const value = input as { sessionID?: string; approval_id?: string }
+        const target = String(value.sessionID ?? "").trim()
         if (!target) return { content: "postal: 'sessionID' is required" }
         if (target === context.sessionID) return { content: "postal: cannot close the calling session" }
         if (typeof ctx.session.remove !== "function") {
           return { content: "postal: deleting sessions is not supported by this OpenCode version" }
         }
-        const allowed = await canOperate(ctx, context.sessionID, target, "close")
-        if (!allowed) {
-          return {
-            content: "postal: not authorized; the target has not granted close to this session",
-          }
-        }
+        const error = await enforceApproval(
+          ctx,
+          context.sessionID,
+          target,
+          "close",
+          value.approval_id?.trim(),
+        )
+        if (error) return { content: `postal: ${error}` }
         // Delete first: if the irreversible step fails, leave parent/child and
         // peer records untouched so the caller can retry.
         try {
