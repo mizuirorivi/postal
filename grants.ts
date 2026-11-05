@@ -267,6 +267,11 @@ export function allowedOperations(grant: RelationGrant, now = Date.now()): Opera
 }
 
 async function defaultsFor(ctx: GrantContext, from: string, to: string): Promise<Record<Operation, GrantRule> | undefined> {
+  // The current parent mirror follows reparenting; the spawn fact is historical.
+  const currentParentOfTo = (await ctx.storage.get(`parent/${to}`)) as { parentID?: unknown } | undefined
+  if (currentParentOfTo?.parentID === from) return defaultOperations("parent")
+  const currentParentOfFrom = (await ctx.storage.get(`parent/${from}`)) as { parentID?: unknown } | undefined
+  if (currentParentOfFrom?.parentID === to) return defaultOperations("child")
   const toSpawn = await readSpawnFact(ctx, to)
   if (toSpawn?.spawnedBy === from) return defaultOperations("parent")
   const fromSpawn = await readSpawnFact(ctx, from)

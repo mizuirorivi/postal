@@ -349,10 +349,11 @@ describe("postal_spawn", () => {
 
 describe("structured postal envelope", () => {
   it("renders kind, task, artifacts, commands, and verification", async () => {
-    const { addSession, rpc, tools, prompts } = await boot()
-    addSession("ses_a", "A")
-    addSession("ses_b", "B")
-    await rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+    const { tools, prompts } = test
 
     const dir = "/tmp/postal-test/postal-envelope-test"
     const path = join(dir, "artifact.txt")
@@ -363,7 +364,7 @@ describe("structured postal envelope", () => {
     try {
       const result = await tools.send.execute(
         {
-          to: "ses_b",
+          to: b.id,
           text: "Phase 1 complete",
           kind: "task",
           task_id: "T1",
@@ -852,19 +853,12 @@ describe("HMAC Phase 1", () => {
     expect((parentEvent.metadata as any).postal.reason).toBeUndefined()
 
     await test.rpc.connect({ sessionID: "ses_c", peerID: b.id })
-    await test.tools.send.execute(
+    const denied = await test.tools.send.execute(
       { to: b.id, text: "task from non-parent", kind: "task" },
       { sessionID: "ses_c" },
     )
-    const fromPeer = test.prompts.at(-1)!
-    const peerEvent = {
-      sessionID: b.id,
-      prompt: { text: fromPeer.text },
-      metadata: structuredClone(fromPeer.metadata),
-    }
-    await test.hooks.prompt(peerEvent)
-    expect(peerEvent.prompt.text).toBe("")
-    expect((peerEvent.metadata as any).postal.reason).toBe("unauthorized_task")
+    expect(denied.content).toContain("task is not granted")
+    expect(test.prompts).toHaveLength(1)
   })
 
   it("rotates keys and keeps the old key valid for the grace period", async () => {
@@ -908,11 +902,11 @@ describe("watchdog and outbox cleanup", () => {
   it("nudges an idle worker with an unacked task", async () => {
     const test = await boot()
     test.addSession("ses_a", "A")
-    test.addSession("ses_b", "B")
-    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
-    await test.rpc.presence({ sessions: [{ id: "ses_b", title: "B", state: "idle", pending: [] }] })
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+    await test.rpc.presence({ sessions: [{ id: b.id, title: "B", state: "idle", pending: [] }] })
     await test.tools.send.execute(
-      { to: "ses_b", text: "do the task", kind: "task", task_id: "T1", msg_id: "msg_task" },
+      { to: b.id, text: "do the task", kind: "task", task_id: "T1", msg_id: "msg_task" },
       { sessionID: "ses_a" },
     )
 
@@ -921,7 +915,7 @@ describe("watchdog and outbox cleanup", () => {
     expect(result.content).toContain("msg_task")
     expect(result.content).toContain("NUDGED\tmsg_task")
     const nudge = test.prompts.at(-1)!
-    expect(nudge.sessionID).toBe("ses_b")
+    expect(nudge.sessionID).toBe(b.id)
     expect(nudge.metadata?.postal?.kind).toBe("system")
     expect(nudge.metadata?.postal?.replyTo).toBe("msg_task")
     expect(nudge.text).toContain("Watchdog")
@@ -932,11 +926,11 @@ describe("watchdog and outbox cleanup", () => {
   it("does not nudge a running worker", async () => {
     const test = await boot()
     test.addSession("ses_a", "A")
-    test.addSession("ses_b", "B")
-    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
-    await test.rpc.presence({ sessions: [{ id: "ses_b", title: "B", state: "running", pending: [] }] })
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+    await test.rpc.presence({ sessions: [{ id: b.id, title: "B", state: "running", pending: [] }] })
     await test.tools.send.execute(
-      { to: "ses_b", text: "do the task", kind: "task", task_id: "T1", msg_id: "msg_task_running" },
+      { to: b.id, text: "do the task", kind: "task", task_id: "T1", msg_id: "msg_task_running" },
       { sessionID: "ses_a" },
     )
 
@@ -1153,7 +1147,7 @@ describe("ACK semantics", () => {
     await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
     await test.rpc.connect({ sessionID: "ses_b", peerID: "ses_c" })
     await test.tools.send.execute(
-      { to: "ses_b", text: "task", kind: "task", task_id: "T1", msg_id: "msg_cross_task" },
+      { to: "ses_b", text: "task", msg_id: "msg_cross_task" },
       { sessionID: "ses_a" },
     )
     await test.tools.send.execute(
@@ -1532,11 +1526,26 @@ describe("inbound receipts", () => {
     const b = [...test.sessions.values()].find((session) => session.title === "B")!
     test.addSession("ses_c", "C")
     await test.rpc.connect({ sessionID: "ses_c", peerID: b.id })
+    // Simulate a stale/misconfigured grant so the sender delivers; the receiver
+    // must still reject because the grant is gone at admission time.
+    const grantKey = `grants/ses_c/${b.id}`
+    test.storage.set(grantKey, {
+      from: "ses_c",
+      to: b.id,
+      operations: {
+        send: { allowed: true, approvalRequired: false },
+        task: { allowed: true, approvalRequired: false },
+      },
+      initialized: true,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    })
     await test.tools.send.execute(
       { to: b.id, text: "task", kind: "task", task_id: "T1", msg_id: "msg_task_unauth" },
       { sessionID: "ses_c" },
     )
     const sent = test.prompts.at(-1)!
+    test.storage.delete(grantKey)
     await test.hooks.prompt({
       sessionID: b.id,
       prompt: { text: sent.text },
@@ -1830,5 +1839,65 @@ describe("v2 relation grants", () => {
       .find((line) => line.startsWith("out\t") && line.includes("ses_c"))
     expect(outLine).toContain("send")
     expect(outLine).not.toContain("task")
+  })
+})
+
+describe("v2 grant enforcement", () => {
+  it("blocks delivery at retry when a grant is revoked", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.tools.send.execute({ to: "ses_b", text: "revocable", msg_id: "msg_revoke" }, { sessionID: "ses_a" })
+    const before = test.prompts.length
+
+    await test.tools.revoke.execute({ to: "ses_b", operations: ["send"] }, { sessionID: "ses_a" })
+    const refused = await test.tools.resend.execute({ msg_id: "msg_revoke" }, { sessionID: "ses_a" })
+    expect(refused.content).toContain("grant revoked")
+    expect(test.prompts.length).toBe(before)
+    expect((test.storage.get(outboxKey("ses_a", "msg_revoke")) as any).status).toBe("revoked")
+
+    await test.tools.grant.execute({ to: "ses_b", operations: ["send"] }, { sessionID: "ses_a" })
+    const resent = await test.tools.resend.execute({ msg_id: "msg_revoke" }, { sessionID: "ses_a" })
+    expect(resent.content).toContain("resent")
+    expect(test.prompts.length).toBe(before + 1)
+  })
+})
+
+describe("v2 supervision and consultation", () => {
+  it("lets A supervise B while B consults A", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+
+    const task = await test.tools.send.execute(
+      { to: b.id, text: "supervised task", kind: "task", task_id: "T1", msg_id: "msg_supervise" },
+      { sessionID: "ses_a" },
+    )
+    expect(task.content).toContain("letter delivered")
+
+    const consult = await test.tools.send.execute(
+      { to: "ses_a", text: "consultation", msg_id: "msg_consult" },
+      { sessionID: b.id },
+    )
+    expect(consult.content).toContain("letter delivered")
+
+    const denied = await test.tools.send.execute(
+      { to: "ses_a", text: "reverse task", kind: "task", msg_id: "msg_reverse_task" },
+      { sessionID: b.id },
+    )
+    expect(denied.content).toContain("task is not granted")
+
+    const interrupt = await test.tools.interrupt.execute({ sessionID: b.id }, { sessionID: "ses_a" })
+    expect(interrupt.content).toContain("interrupted")
+    const reverseInterrupt = await test.tools.interrupt.execute({ sessionID: "ses_a" }, { sessionID: b.id })
+    expect(reverseInterrupt.content).toContain("not authorized")
+
+    const escalation = await test.tools.grant.execute(
+      { to: "ses_a", operations: ["task"] },
+      { sessionID: b.id },
+    )
+    expect(escalation.content).toContain("only the spawn parent")
   })
 })

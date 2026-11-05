@@ -31,6 +31,7 @@ import {
   allowedOperations,
   ensureGrant,
   grantOperations,
+  isRuleActive,
   listGrants,
   OPERATION_SPECS,
   OPERATIONS,
@@ -166,7 +167,7 @@ type ParentRecord = { parentID: string; createdAt: number }
 type HmacKey = { keyID: string; key: string; createdAt: number; validUntil?: number }
 type HmacRecord = { current: HmacKey; previous: HmacKey[] }
 
-type OutboxStatus = "pending" | "delivered" | "acked" | "rejected" | "failed"
+type OutboxStatus = "pending" | "delivered" | "acked" | "rejected" | "revoked" | "failed"
 type OutboxRecord = {
   msgID: string
   from: string
@@ -396,9 +397,23 @@ async function removeParent(ctx: PostalContext, childID: string): Promise<void> 
   })
 }
 
-/** A session may inspect itself, or a session it can command as parent/ancestor. */
+/** A session may inspect itself, or a session that granted it `history`. */
 async function canInspect(ctx: PostalContext, actor: string, target: string): Promise<boolean> {
-  return target === actor || (await isAuthorizedParent(ctx, actor, target))
+  if (target === actor) return true
+  const grant = await ensureGrant(ctx, stateLock(ctx), actor, target)
+  return Boolean(grant && isRuleActive(grant.operations.history, "history"))
+}
+
+/** A session may interrupt/close itself or a session that granted it that operation. */
+async function canOperate(
+  ctx: PostalContext,
+  actor: string,
+  target: string,
+  operation: "interrupt" | "close",
+): Promise<boolean> {
+  if (actor === target) return true
+  const grant = await ensureGrant(ctx, stateLock(ctx), actor, target)
+  return Boolean(grant && isRuleActive(grant.operations[operation], operation))
 }
 
 /** Check whether actor is the direct parent of target, or an ancestor when enabled. */
@@ -1103,6 +1118,15 @@ async function attemptOutbox(ctx: PostalContext, input: OutboxRecord): Promise<O
       return { ...input, status: "failed", lastError: "outbox record missing", nextAt: 0 }
     }
     if (record.status !== "pending") return record
+    // F-08: a grant may have been revoked after the record was created.
+    const operation: Operation = record.envelope.kind === "task" ? "task" : "send"
+    const relation = await ensureGrant(ctx, stateLock(ctx), record.from, record.to)
+    if (!relation || !isRuleActive(relation.operations[operation], operation)) {
+      record.status = "revoked"
+      record.lastError = "grant_revoked"
+      await updateOutbox(ctx, record)
+      return record
+    }
     if (record.queuedForWindow) {
       // The rally window has passed; count this delivery as the first letter
       // of the new window.
@@ -1365,6 +1389,7 @@ async function cleanupOutbox(
       (record.status === "delivered" ||
         record.status === "acked" ||
         record.status === "rejected" ||
+        record.status === "revoked" ||
         record.status === "failed") &&
       now - record.createdAt > ttl,
   )
@@ -1747,6 +1772,7 @@ async function setup(ctx: PostalContext): Promise<void> {
             `SESSION_ORPHAN\t${parent ? "no" : "yes — no parent; no one can close this session"}`,
             `OUTBOX_PENDING\t${outbox.filter((record) => record.status === "pending").length}`,
             `OUTBOX_REJECTED\t${outbox.filter((record) => record.status === "rejected").length}`,
+            `OUTBOX_REVOKED\t${outbox.filter((record) => record.status === "revoked").length}`,
             "PEER_ID\tTITLE\tRALLY_REMAINING\tLAST_LETTER\tRALLY_RESET_AT\tSTATE\tINBOX_COUNT\tPRESENCE_AT",
             ...rows,
           ].join("\n"),
@@ -1788,6 +1814,16 @@ async function setup(ctx: PostalContext): Promise<void> {
             )
           : []
         if (operations.length === 0) return { content: "postal: at least one valid operation is required" }
+        const authority = operations.filter((operation) => operation !== "send")
+        if (authority.length > 0) {
+          const parentRecord = (await ctx.storage.get(`parent/${to}`)) as { parentID?: unknown } | undefined
+          const spawn = await readSpawnFact(ctx, to)
+          const owner =
+            typeof parentRecord?.parentID === "string" ? parentRecord.parentID : spawn?.spawnedBy
+          if (owner !== context.sessionID) {
+            return { content: "postal: only the spawn parent can grant authority over a session" }
+          }
+        }
         try {
           const grant = await grantOperations(ctx, stateLock(ctx), context.sessionID, to, operations, {
             ...(typeof value.approvalRequired === "boolean" ? { approvalRequired: value.approvalRequired } : {}),
@@ -2137,6 +2173,13 @@ async function setup(ctx: PostalContext): Promise<void> {
             return { content: `postal: delivery failed: session not found: ${to}` }
           }
         }
+        const relation = await ensureGrant(ctx, stateLock(ctx), context.sessionID, to)
+        const operation: Operation = kind === "task" ? "task" : "send"
+        if (!relation || !isRuleActive(relation.operations[operation], operation)) {
+          return {
+            content: `postal: ${operation} is not granted for ${to}; inspect postal_relations.`,
+          }
+        }
         const envelope: Envelope = {
           kind: kind ?? "letter",
           taskID,
@@ -2262,6 +2305,12 @@ async function setup(ctx: PostalContext): Promise<void> {
             rows.push(`${peer.id}	error	-	msg_id too long`)
             continue
           }
+          const grant = await ensureGrant(ctx, stateLock(ctx), context.sessionID, peer.id)
+          const operation: Operation = kind === "task" ? "task" : "send"
+          if (!grant || !isRuleActive(grant.operations[operation], operation)) {
+            rows.push(`${peer.id}	not-granted	${msgID}	${operation} not granted`)
+            continue
+          }
           const envelope: Envelope = {
             kind: kind ?? "letter",
             taskID: value.task_id?.trim() || undefined,
@@ -2286,7 +2335,7 @@ async function setup(ctx: PostalContext): Promise<void> {
     editor.add({
       name: "inbox",
       description:
-        "List this session's outbox: pending, delivered, rejected, acked, or failed letters. " +
+        "List this session's outbox: pending, delivered, rejected, revoked, acked, or failed letters. " +
         "This is the delivery queue, not the AI inbox.",
       input: {
         type: "object",
@@ -2390,6 +2439,9 @@ async function setup(ctx: PostalContext): Promise<void> {
         if (!prepared.ok) return { content: prepared.content }
         const result = await attemptOutbox(ctx, prepared.record)
         if (result.status === "delivered") return { content: `postal: resent ${msgID}` }
+        if (result.status === "revoked") {
+          return { content: `postal: resend refused: grant revoked for ${prepared.record.to}` }
+        }
         if (result.status === "failed") {
           return { content: `postal: resend failed: ${result.lastError ?? "unknown error"}` }
         }
@@ -2615,12 +2667,10 @@ async function setup(ctx: PostalContext): Promise<void> {
         const target = String((input as { sessionID?: unknown }).sessionID ?? context.sessionID)
         if (!target) return { content: "postal: no session to interrupt" }
         if (target !== context.sessionID) {
-          const allowed = await isAuthorizedParent(ctx, context.sessionID, target)
+          const allowed = await canOperate(ctx, context.sessionID, target, "interrupt")
           if (!allowed) {
             return {
-              content:
-                "postal: not authorized; only the spawning parent (or an allowed ancestor) " +
-                "can interrupt this session",
+              content: "postal: not authorized; the target has not granted interrupt to this session",
             }
           }
         }
@@ -2651,12 +2701,10 @@ async function setup(ctx: PostalContext): Promise<void> {
         if (typeof ctx.session.remove !== "function") {
           return { content: "postal: deleting sessions is not supported by this OpenCode version" }
         }
-        const allowed = await isAuthorizedParent(ctx, context.sessionID, target)
+        const allowed = await canOperate(ctx, context.sessionID, target, "close")
         if (!allowed) {
           return {
-            content:
-              "postal: not authorized; only the spawning parent (or an allowed ancestor) " +
-              "can close this session",
+            content: "postal: not authorized; the target has not granted close to this session",
           }
         }
         // Delete first: if the irreversible step fails, leave parent/child and
@@ -2773,7 +2821,8 @@ async function setup(ctx: PostalContext): Promise<void> {
       }
       let authorizedBy: string | undefined
       if (kind === "task") {
-        authorizedBy = from ? await authorizingAncestor(ctx, from, event.sessionID) : undefined
+        const taskGrant = from ? await ensureGrant(ctx, stateLock(ctx), from, event.sessionID) : undefined
+        authorizedBy = taskGrant && isRuleActive(taskGrant.operations.task, "task") ? from : undefined
         if (!authorizedBy) {
           if (receiptBase) {
             await putReceipt(ctx, {
