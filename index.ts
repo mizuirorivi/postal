@@ -1212,10 +1212,8 @@ async function peerStatus(ctx: PostalContext, sessionID: string): Promise<PairRe
         }),
       )
     ).filter((peer): peer is PeerRecord => Boolean(peer))
-    if (live.length !== peers.length) {
-      await writePeers(ctx, sessionID, live)
-      await refreshNote(ctx, sessionID)
-    }
+    // Read-only: a transient lookup failure must not delete the pair.
+    // Explicit disconnect (or a future prune command) owns removal.
     const result: PairResult = { ok: true, peers: live }
     if (live[0]) {
       result.peerID = live[0].id
@@ -2130,14 +2128,24 @@ async function setup(ctx: PostalContext): Promise<void> {
               "can close this session",
           }
         }
+        // Delete first: if the irreversible step fails, leave parent/child and
+        // peer records untouched so the caller can retry.
         try {
-          await disconnect(ctx, target)
-          await applyOrphanPolicy(ctx, target)
           await ctx.session.remove({ sessionID: target })
-          return { content: `postal: closed ${target} and disconnected its peers` }
         } catch (error) {
           return { content: `postal: close failed: ${errorText(error)}` }
         }
+        try {
+          await disconnect(ctx, target)
+        } catch (error) {
+          console.warn(`postal: disconnect after close failed: ${errorText(error)}`)
+        }
+        try {
+          await applyOrphanPolicy(ctx, target)
+        } catch (error) {
+          console.warn(`postal: orphan policy after close failed: ${errorText(error)}`)
+        }
+        return { content: `postal: closed ${target} and disconnected its peers` }
       },
     })
   })

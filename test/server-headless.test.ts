@@ -1163,3 +1163,54 @@ describe("ACK semantics", () => {
     expect((test.storage.get("outbox/msg_cross_task") as any).status).toBe("delivered")
   })
 })
+
+describe("session lifecycle integrity", () => {
+  it("keeps parent links intact when session removal fails", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+    await test.tools.spawn.execute({ title: "C" }, { sessionID: b.id })
+    const c = [...test.sessions.values()].find((session) => session.title === "C")!
+
+    const original = test.context.session.remove
+    test.context.session.remove = async () => {
+      throw new Error("remove failed")
+    }
+    const first = await test.tools.close.execute({ sessionID: b.id }, { sessionID: "ses_a" })
+    expect(first.content).toContain("close failed")
+    expect(test.sessions.has(b.id)).toBe(true)
+    expect(test.storage.get(`parent/${b.id}`)).toBeDefined()
+    expect((test.storage.get(`parent/${c.id}`) as any).parentID).toBe(b.id)
+
+    test.context.session.remove = original
+    const retry = await test.tools.close.execute({ sessionID: b.id }, { sessionID: "ses_a" })
+    expect(retry.content).toContain("closed")
+    expect((test.storage.get(`parent/${c.id}`) as any).parentID).toBe("ses_a")
+  })
+
+  it("does not drop a peer when a status lookup fails transiently", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+
+    const original = test.context.session.get
+    let failed = false
+    test.context.session.get = async (input: any) => {
+      if (input.sessionID === "ses_b" && !failed) {
+        failed = true
+        throw new Error("transient")
+      }
+      return original(input)
+    }
+
+    const first = await test.tools.status.execute({}, { sessionID: "ses_a" })
+    expect(first.content).not.toContain("ses_b")
+    expect(test.storage.get("peers/ses_a")).toBeDefined()
+
+    const second = await test.tools.status.execute({}, { sessionID: "ses_a" })
+    expect(second.content).toContain("ses_b")
+    test.context.session.get = original
+  })
+})
