@@ -307,6 +307,8 @@ mode (records are written, but `close`/`interrupt` do not require them).
 `postal_audit` returns append-only records for grants, revocations, delivery
 changes, task state, and approval request/approve/reject/consume. The caller
 sees its own records, or records for a target it may inspect with `history`.
+The background cleanup removes audit records older than `outboxTtlDays`
+(default 7) together with the outbox cleanup.
 
 ### HMAC Phase 1
 

@@ -59,7 +59,7 @@ import {
   type RelationGrant,
 } from "./grants.js"
 import { answerQuestion } from "./question-answer.js"
-import { appendAudit, listAudit } from "./audit.js"
+import { appendAudit, cleanupAudit, listAudit } from "./audit.js"
 import {
   APPROVAL_OPERATIONS,
   approvalOperationSpec,
@@ -3664,6 +3664,7 @@ async function setup(ctx: PostalContext): Promise<void | (() => void)> {
         // Background cleanup is not a dry run; the tool keeps the dry-run default.
         void cleanupOutbox(ctx, { dryRun: false })
         void cleanupSeen(ctx)
+        void cleanupAudit(ctx, stateLock(ctx), Number(ctx.options?.outboxTtlDays ?? 7))
       }
     }, RETRY_INTERVAL_MS)
     timer.unref?.()

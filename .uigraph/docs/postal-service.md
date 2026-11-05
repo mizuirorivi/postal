@@ -113,6 +113,7 @@ and the prompt hook ignores them, so they are not forwarded again.
 - **Audit.** `postal_audit` reads append-only records for grant, revoke,
   delivery, task, and approval request/approve/reject/consume. The caller sees
   its own records, or records for a target it may inspect with `history`.
+  The background cleanup removes records older than `outboxTtlDays` (default 7).
 - **Tasks.** Assignment/task letters create `task/<from>/<taskID>` state
   (`open`/`in_progress`/`blocked`/`done`/`cancelled`). ACK does not complete a
   task; `postal_task_state` updates it. `request` uses `send`, `assignment` uses

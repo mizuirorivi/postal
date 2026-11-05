@@ -107,3 +107,30 @@ async function readAuditIndex(ctx: AuditContext): Promise<string[]> {
   const value = await ctx.storage.get(AUDIT_INDEX)
   return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : []
 }
+
+/** Remove audit records older than the retention window. */
+export async function cleanupAudit(
+  ctx: AuditContext,
+  lock: Lock,
+  retentionDays = 7,
+): Promise<number> {
+  const days = Number.isFinite(retentionDays) ? Math.max(1, Math.min(365, retentionDays)) : 7
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000
+  return lock(AUDIT_INDEX, async () => {
+    const index = await readAuditIndex(ctx)
+    const keep: string[] = []
+    let removed = 0
+    for (const auditID of index) {
+      const record = await readAudit(ctx, auditID)
+      const at = record?.at ?? Number(auditID.split("_")[0])
+      if (!Number.isFinite(at) || at < cutoff) {
+        await ctx.storage.remove(auditKey(auditID))
+        removed += 1
+      } else {
+        keep.push(auditID)
+      }
+    }
+    if (removed > 0) await ctx.storage.set(AUDIT_INDEX, keep)
+    return removed
+  })
+}
