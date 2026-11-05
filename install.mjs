@@ -58,6 +58,8 @@ const files = [
   "rpc.ts",
   "lock.ts",
   "fuzzy.ts",
+  "sessions.ts",
+  "status.ts",
   "package.json",
   "README.md",
   "LICENSE",

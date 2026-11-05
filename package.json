@@ -1,8 +1,11 @@
 {
   "name": "opencode-postal",
   "version": "0.1.0",
-  "description": "Session-to-session mail for OpenCode: @mentions, postal_send, Ctrl+P pairing, RPC, rally limits.",
+  "description": "Session-to-session mail for OpenCode: @mentions, postal_send, multi-peer Ctrl+P pairing, RPC, rally limits.",
   "type": "module",
+  "scripts": {
+    "test": "bun test"
+  },
   "bin": {
     "opencode-postal": "./install.mjs"
   },
@@ -17,6 +20,8 @@
     "rpc.ts",
     "lock.ts",
     "fuzzy.ts",
+    "sessions.ts",
+    "status.ts",
     "install.mjs",
     "skills",
     "README.md",
