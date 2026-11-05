@@ -19,7 +19,7 @@ Legend: ✅ implemented, ◐ partial, ❌ missing.
 | F-07 | Distinguish collaborative request from forced assignment | ◐ | `kind: "task"` is the only assignment form; no collaborative request type. |
 | F-08 | Revocation/permission changes apply to undelivered mail | ❌ | Outbox/hold queues are not filtered by current grants. |
 | F-09 | Approval tied to a concrete operation (proposer/approver/executor, hash, expiry) | ❌ | No approval record or workflow. |
-| F-10 | Only enforceable operations marked approval-required | ❌ | No policy surface. |
+| F-10 | All operations represented, with an enforceable flag and an "approval required but not enforceable" state | ❌ | No policy surface or host-permission interface. |
 | F-11 | Auditable settings and decisions | ◐ | `postal_log` and receipts exist; grants/approvals/settings changes are not audited. |
 | R-01/P0 | Reject delivery after disconnect | ❌ | `postal_send` with explicit `to` validates only `session.get`; it does not require an active pair. |
 | R-02/P0 | Do not infer a recipient from lookup results | ◐ | Without `to`, `postal_send` uses `peerStatus` live peers; a live but unpaired session can be selected. |
@@ -111,8 +111,8 @@ Best 1–2 weeks / worst 3–5 weeks.
 ### M2 — Delivery and task separation (F-05..F-08)
 
 - Relation delivery policy: `inbox` (non-waking, TUI inbox), `idle` (start when
-  the target is idle), `interrupt` (steer). Default `inbox` for new relations;
-  migrate existing peers to `idle` to preserve behavior.
+  the target is idle), `interrupt` (steer). Human decision: default `interrupt`
+  for new relations, matching the current steer behavior; no behavioral migration.
 - Separate records: message state (`delivered`/`read`/`acked`) and task state
   (`open`/`in_progress`/`done`/`rejected`). `task/<id>` records; receipts and
   ACKs stay message-level.
@@ -128,10 +128,12 @@ Best 1–2 weeks / worst 3–5 weeks.
 - Approval record: `{ id, operation, resourceHash, proposer, approver, executor,
   expiresAt, status, reason }`. Approver must hold `approve` (or be the parent
   when configured); proposer ≠ approver ≠ executor where required.
-- Policy: only operations Postal can actually enforce can be marked
-  approval-required (e.g., `postal_close`, `postal_interrupt`, a guarded
-  `postal_exec`/deploy hook). Do not claim to gate shell/edit unless integrated
-  with host permissions.
+- Policy: every operation is represented in the approval framework. Each
+  operation carries an `enforceable` flag (`postal`, `host`, or `none`), and the
+  UI marks non-enforceable operations as "approval required but not enforceable
+  by Postal". `postal_close`, `postal_interrupt`, `postal_spawn`,
+  `postal_send`/`task`, `postal_history`, and `postal_approve` are postal-enforced;
+  shell/edit/deploy require a host-permission or guarded-tool integration.
 - `postal_approve`/`postal_reject`; expiry and hash binding; audit log for
   grant/revoke/approval changes.
 - The required scenario: A supervises B but cannot skip a production approval;
@@ -171,7 +173,8 @@ Best 3–5 days / worst 1–2 weeks. Total v2 (M0–M3): **best 4–8 weeks, wor
 
 - **Enforcement boundary:** Postal can enforce its own operations; it cannot
   stop arbitrary shell/deploy unless the host permission system or a guarded
-  tool is involved. F-10 must label only enforceable operations.
+  tool is involved. F-10 records all operations but must distinguish
+  enforceable from advisory approvals.
 - **Core form API:** `form.created`/`replied` events exist; `ctx.session.form.reply`
   must be runtime-verified for question forwarding.
 - **Global plugin storage:** keys/pairs are shared across locations on the same
