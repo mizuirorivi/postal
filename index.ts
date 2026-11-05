@@ -818,8 +818,8 @@ const OUTBOX_INDEX = "outbox/index"
 const outboxLocks = new Map<string, Promise<unknown>>()
 const claimLocks = new Map<string, Promise<unknown>>()
 const peerLocks = new Map<string, Promise<unknown>>()
-let outboxTimer: ReturnType<typeof setInterval> | undefined
-let lastOutboxCleanupAt = 0
+const outboxTimers = new Map<string, ReturnType<typeof setInterval>>()
+const lastOutboxCleanupAt = new Map<string, number>()
 const MAX_OUTBOX_ATTEMPTS = 6
 const RETRY_INTERVAL_MS = 15_000
 
@@ -942,8 +942,11 @@ async function markOutboxAcked(
 /** Retry one outbox record and persist its new state. */
 async function attemptOutbox(ctx: PostalContext, input: OutboxRecord): Promise<OutboxRecord> {
   return serialized(outboxLocks, `record/${input.from}/${input.msgID}`, async () => {
-    const record = (await getOutbox(ctx, input.msgID, input.from)) ?? input
-    if (record.status === "delivered" || record.status === "acked") return record
+    const record = await getOutbox(ctx, input.msgID, input.from)
+    if (!record) {
+      return { ...input, status: "failed", lastError: "outbox record missing", nextAt: 0 }
+    }
+    if (record.status !== "pending") return record
     if (record.queuedForWindow) {
       // The rally window has passed; count this delivery as the first letter
       // of the new window.
@@ -1064,16 +1067,27 @@ async function dispatchLetter(
   }
 }
 
-/** Retry all due outbox records. */
-async function retryOutbox(ctx: PostalContext): Promise<void> {
-  await serialized(outboxLocks, "retry", async () => {
-    const now = Date.now()
-    const records = await listOutbox(ctx)
-    for (const record of records) {
-      if (record.status !== "pending" || record.nextAt > now) continue
-      await attemptOutbox(ctx, record)
-    }
+const retryInFlight = new Set<string>()
+
+/** Retry due records in parallel; a hung destination only holds its own slot. */
+async function retryOutbox(ctx: PostalContext, from?: string): Promise<void> {
+  const now = Date.now()
+  const records = await listOutbox(ctx, from)
+  const due = records.filter((record) => {
+    if (record.status !== "pending" || record.nextAt > now) return false
+    return !retryInFlight.has(`${ctx.location.directory}:${record.from}/${record.msgID}`)
   })
+  await Promise.allSettled(
+    due.map(async (record) => {
+      const id = `${ctx.location.directory}:${record.from}/${record.msgID}`
+      retryInFlight.add(id)
+      try {
+        await attemptOutbox(ctx, record)
+      } finally {
+        retryInFlight.delete(id)
+      }
+    }),
+  )
 }
 
 /** Nudge idle workers that still have an unacked task letter. */
@@ -1976,6 +1990,18 @@ async function setup(ctx: PostalContext): Promise<void> {
     })
 
     editor.add({
+      name: "retry",
+      description: "Scan this session's pending outbox records and retry the due ones now.",
+      input: { type: "object", properties: {}, additionalProperties: false },
+      execute: async (_input, context) => {
+        await retryOutbox(ctx, context.sessionID)
+        const records = await listOutbox(ctx, context.sessionID)
+        const pending = records.filter((record) => record.status === "pending").length
+        return { content: ["RETRY_DONE", `PENDING\t${pending}`].join("\n") }
+      },
+    })
+
+    editor.add({
       name: "claim",
       description:
         "Take an advisory lock for a path or task. Re-claim before the TTL expires to heartbeat. " +
@@ -2244,16 +2270,21 @@ async function setup(ctx: PostalContext): Promise<void> {
   // Delivery retries run in the server process; unref keeps the timer from
   // holding the process open.
   try {
-    if (outboxTimer) clearInterval(outboxTimer)
-    outboxTimer = setInterval(() => {
+    const timerKey = ctx.location.directory
+    const previousTimer = outboxTimers.get(timerKey)
+    if (previousTimer) clearInterval(previousTimer)
+    const timer = setInterval(() => {
       void retryOutbox(ctx)
       void runWatchdog(ctx)
-      if (Date.now() - lastOutboxCleanupAt > 60 * 60 * 1000) {
-        lastOutboxCleanupAt = Date.now()
-        void cleanupOutbox(ctx)
+      const lastCleanup = lastOutboxCleanupAt.get(timerKey) ?? 0
+      if (Date.now() - lastCleanup > 60 * 60 * 1000) {
+        lastOutboxCleanupAt.set(timerKey, Date.now())
+        // Background cleanup is not a dry run; the tool keeps the dry-run default.
+        void cleanupOutbox(ctx, { dryRun: false })
       }
     }, RETRY_INTERVAL_MS)
-    outboxTimer.unref?.()
+    timer.unref?.()
+    outboxTimers.set(timerKey, timer)
   } catch {
     // Timers are optional in restricted runtimes.
   }

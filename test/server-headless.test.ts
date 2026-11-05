@@ -1304,3 +1304,129 @@ describe("concurrency and sender scoping", () => {
     expect(test.storage.has(outboxKey("ses_c", "msg_shared"))).toBe(true)
   })
 })
+
+describe("outbox integrity", () => {
+  it("rolls back a record when the outbox index write fails", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    const original = test.context.storage.set
+    let failed = false
+    test.context.storage.set = async (key: string, value: unknown) => {
+      if (key === "outbox/index" && !failed) {
+        failed = true
+        throw new Error("index write failed")
+      }
+      return original(key, value)
+    }
+    await expect(
+      test.tools.send.execute({ to: "ses_b", text: "hello", msg_id: "msg_index_fail" }, { sessionID: "ses_a" }),
+    ).rejects.toThrow("index write failed")
+    expect(test.storage.has(outboxKey("ses_a", "msg_index_fail"))).toBe(false)
+    test.context.storage.set = original
+  })
+
+  it("does not resend delivered records during retry", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.tools.send.execute({ to: "ses_b", text: "hello", msg_id: "msg_delivered" }, { sessionID: "ses_a" })
+    const before = test.prompts.length
+    const retry = await test.tools.retry.execute({}, { sessionID: "ses_a" })
+    expect(retry.content).toContain("RETRY_DONE")
+    expect(test.prompts.length).toBe(before)
+    expect((test.storage.get(outboxKey("ses_a", "msg_delivered")) as any).status).toBe("delivered")
+  })
+
+  it("does not resurrect a record deleted between listing and attempt", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.tools.send.execute({ to: "ses_b", text: "hello", msg_id: "msg_gone" }, { sessionID: "ses_a" })
+    const key = outboxKey("ses_a", "msg_gone")
+    const record = test.storage.get(key) as any
+    record.status = "pending"
+    record.nextAt = 0
+    record.attempts = 0
+    test.storage.set(key, record)
+    const before = test.prompts.length
+
+    const originalGet = test.context.storage.get
+    let reads = 0
+    test.context.storage.get = async (storageKey: string) => {
+      if (storageKey === key) {
+        reads += 1
+        if (reads > 1) return undefined
+      }
+      return originalGet(storageKey)
+    }
+    const retry = await test.tools.retry.execute({}, { sessionID: "ses_a" })
+    test.context.storage.get = originalGet
+    expect(retry.content).toContain("RETRY_DONE")
+    expect(test.prompts.length).toBe(before)
+  })
+})
+
+describe("retry availability", () => {
+  it("keeps retrying other destinations while one prompt hangs", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    test.addSession("ses_c", "C")
+    await test.tools.send.execute({ to: "ses_b", text: "slow", msg_id: "msg_slow" }, { sessionID: "ses_a" })
+    await test.tools.send.execute({ to: "ses_c", text: "fast", msg_id: "msg_fast" }, { sessionID: "ses_a" })
+    for (const id of ["msg_slow", "msg_fast"]) {
+      const key = outboxKey("ses_a", id)
+      const record = test.storage.get(key) as any
+      record.status = "pending"
+      record.nextAt = 0
+      record.attempts = 0
+      test.storage.set(key, record)
+    }
+
+    const originalPrompt = test.context.session.prompt
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    test.context.session.prompt = async (input: any) => {
+      if (input.sessionID === "ses_b") await gate
+      return originalPrompt(input)
+    }
+
+    try {
+      const before = test.prompts.filter((prompt) => prompt.sessionID === "ses_c").length
+      const retry = test.tools.retry.execute({}, { sessionID: "ses_a" })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      const after = test.prompts.filter((prompt) => prompt.sessionID === "ses_c").length
+      release()
+      await retry
+      expect(after).toBeGreaterThan(before)
+    } finally {
+      release()
+      test.context.session.prompt = originalPrompt
+    }
+  })
+
+  it("keeps one retry timer per location", async () => {
+    const originalInterval = globalThis.setInterval
+    let calls = 0
+    ;(globalThis as any).setInterval = (fn: any, ms?: number) => {
+      calls += 1
+      return originalInterval(fn, ms as any)
+    }
+    try {
+      const a = harness()
+      a.context.location.directory = "/tmp/postal-loc-a"
+      await plugin.setup(a.context)
+      const b = harness()
+      b.context.location.directory = "/tmp/postal-loc-b"
+      await plugin.setup(b.context)
+      expect(calls).toBe(2)
+      await plugin.setup(a.context)
+      expect(calls).toBe(3)
+    } finally {
+      ;(globalThis as any).setInterval = originalInterval
+    }
+  })
+})
