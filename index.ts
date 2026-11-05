@@ -1195,14 +1195,26 @@ async function attemptOutbox(ctx: PostalContext, input: OutboxRecord): Promise<O
       return { ...input, status: "failed", lastError: "outbox record missing", nextAt: 0 }
     }
     if (record.status !== "pending") return record
-    // F-08: a grant may have been revoked after the record was created.
-    const operation: Operation = record.envelope.kind === "task" || record.envelope.kind === "assignment" ? "task" : "send"
-    const relation = await ensureGrant(ctx, stateLock(ctx), record.from, record.to)
-    if (!relation || !isRuleActive(relation.operations[operation], operation)) {
-      record.status = "revoked"
-      record.lastError = "grant_revoked"
-      await updateOutbox(ctx, record)
-      return record
+    // R-01: a disconnect must stop pending delivery even if a stale grant
+    // somehow survived. System notices are internal and bypass this check.
+    if (record.envelope.kind !== "system") {
+      const peers = await readPeers(ctx, record.from)
+      if (!peers.some((peer) => peer.id === record.to)) {
+        record.status = "revoked"
+        record.lastError = "not_paired"
+        await updateOutbox(ctx, record)
+        return record
+      }
+      // F-08: a grant may have been revoked after the record was created.
+      const operation: Operation =
+        record.envelope.kind === "task" || record.envelope.kind === "assignment" ? "task" : "send"
+      const relation = await ensureGrant(ctx, stateLock(ctx), record.from, record.to)
+      if (!relation || !isRuleActive(relation.operations[operation], operation)) {
+        record.status = "revoked"
+        record.lastError = "grant_revoked"
+        await updateOutbox(ctx, record)
+        return record
+      }
     }
     if (record.queuedForWindow) {
       // The rally window has passed; count this delivery as the first letter
@@ -1619,6 +1631,9 @@ async function pair(ctx: PostalContext, from: string, peerID: string): Promise<P
         await ensureHmacRecord(ctx, from, peerID)
         await ensureGrant(ctx, stateLock(ctx), from, peerID)
         await ensureGrant(ctx, stateLock(ctx), peerID, from)
+        // Reconnecting restores the communication grant, never authority.
+        await grantOperations(ctx, stateLock(ctx), from, peerID, ["send"])
+        await grantOperations(ctx, stateLock(ctx), peerID, from, ["send"])
         await Promise.all([refreshNote(ctx, from), refreshNote(ctx, peerID)])
         return { ok: true, peerID, title: peer.title ?? "" }
       } catch (error) {
@@ -1670,11 +1685,16 @@ async function disconnectLocked(ctx: PostalContext, sessionID: string, peerID?: 
     if (peerID && targets.length === 0) {
       // The other side may still have a one-sided record; clean it anyway.
       await removePeer(ctx, peerID, sessionID)
+      await revokeOperations(ctx, stateLock(ctx), sessionID, peerID)
+      await revokeOperations(ctx, stateLock(ctx), peerID, sessionID)
       await clearNote(ctx, sessionID)
       return { ok: true, peerID }
     }
     for (const peer of targets) {
       await removePeer(ctx, peer.id, sessionID)
+      // Disconnect is the revocation point: pending delivery must not survive it.
+      await revokeOperations(ctx, stateLock(ctx), sessionID, peer.id)
+      await revokeOperations(ctx, stateLock(ctx), peer.id, sessionID)
     }
     if (peerID) await removePeer(ctx, sessionID, peerID)
     else await writePeers(ctx, sessionID, [])

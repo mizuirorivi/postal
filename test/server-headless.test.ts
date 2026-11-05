@@ -2119,3 +2119,32 @@ describe("v2 revocation propagation", () => {
     expect(taskLine).toContain("cancelled")
   })
 })
+
+describe("v2 disconnect revocation", () => {
+  it("stops pending delivery after disconnect and restores send on reconnect", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.tools.send.execute({ to: "ses_b", text: "pending", msg_id: "msg_r01" }, { sessionID: "ses_a" })
+    const key = outboxKey("ses_a", "msg_r01")
+    const record = test.storage.get(key) as any
+    record.status = "pending"
+    record.nextAt = 0
+    test.storage.set(key, record)
+    await test.rpc.disconnect({ sessionID: "ses_a", peerID: "ses_b" })
+    const before = test.prompts.length
+
+    await test.tools.retry.execute({}, { sessionID: "ses_a" })
+    expect((test.storage.get(key) as any).status).toBe("revoked")
+    expect((test.storage.get(key) as any).lastError).toBe("not_paired")
+    expect(test.prompts.length).toBe(before)
+
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    const resent = await test.tools.send.execute(
+      { to: "ses_b", text: "after reconnect", msg_id: "msg_after_reconnect" },
+      { sessionID: "ses_a" },
+    )
+    expect(resent.content).toContain("delivered")
+  })
+})
