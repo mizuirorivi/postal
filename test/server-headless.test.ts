@@ -584,7 +584,10 @@ describe("claims and lifecycle", () => {
   })
 
   it("interrupts and closes a spawned child after disconnecting its peers", async () => {
-    const { addSession, rpc, tools, interrupts, removes, sessions } = await boot()
+    const test = await boot()
+    // This test covers grant authorization, not the M3 approval policy.
+    test.context.options.enforceApprovals = false
+    const { addSession, rpc, tools, interrupts, removes, sessions } = test
     addSession("ses_a", "A")
     const spawned = await tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
     expect(spawned.content).toContain("spawned")
@@ -707,7 +710,9 @@ describe("commander allowlist", () => {
   })
 
   it("allows only the direct parent by default", async () => {
-    const { addSession, tools, sessions } = await boot()
+    const test = await boot()
+    test.context.options.enforceApprovals = false
+    const { addSession, tools, sessions } = test
     addSession("ses_a", "A")
     await tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
     const b = [...sessions.values()].find((session) => session.title === "B")!
@@ -728,7 +733,7 @@ describe("commander allowlist", () => {
     const b = [...test.sessions.values()].find((session) => session.title === "B")!
     await test.tools.spawn.execute({ title: "C" }, { sessionID: b.id })
     const c = [...test.sessions.values()].find((session) => session.title === "C")!
-    test.context.options = { allowAncestorCommands: true }
+    test.context.options = { allowAncestorCommands: true, enforceApprovals: false }
 
     const byAncestor = await test.tools.close.execute({ sessionID: c.id }, { sessionID: "ses_a" })
     expect(byAncestor.content).toContain("closed")
@@ -736,6 +741,7 @@ describe("commander allowlist", () => {
 
   it("reparents children to the grandparent when a parent is closed", async () => {
     const test = await boot()
+    test.context.options.enforceApprovals = false
     test.addSession("ses_a", "A")
     await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
     const b = [...test.sessions.values()].find((session) => session.title === "B")!
@@ -766,7 +772,7 @@ describe("orphanPolicy", () => {
     const b = [...test.sessions.values()].find((session) => session.title === "B")!
     await test.tools.spawn.execute({ title: "C" }, { sessionID: b.id })
     const c = [...test.sessions.values()].find((session) => session.title === "C")!
-    test.context.options = { orphanPolicy: "detach" }
+    test.context.options = { orphanPolicy: "detach", enforceApprovals: false }
 
     await test.tools.close.execute({ sessionID: b.id }, { sessionID: "ses_a" })
 
@@ -785,7 +791,7 @@ describe("orphanPolicy", () => {
     const b = [...test.sessions.values()].find((session) => session.title === "B")!
     await test.tools.spawn.execute({ title: "C" }, { sessionID: b.id })
     const c = [...test.sessions.values()].find((session) => session.title === "C")!
-    test.context.options = { orphanPolicy: "terminate" }
+    test.context.options = { orphanPolicy: "terminate", enforceApprovals: false }
 
     await test.tools.close.execute({ sessionID: b.id }, { sessionID: "ses_a" })
 
@@ -1178,6 +1184,7 @@ describe("ACK semantics", () => {
 describe("session lifecycle integrity", () => {
   it("keeps parent links intact when session removal fails", async () => {
     const test = await boot()
+    test.context.options.enforceApprovals = false
     test.addSession("ses_a", "A")
     await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
     const b = [...test.sessions.values()].find((session) => session.title === "B")!
@@ -1937,6 +1944,7 @@ describe("v2 grant enforcement", () => {
 describe("v2 supervision and consultation", () => {
   it("lets A supervise B while B consults A", async () => {
     const test = await boot()
+    test.context.options.enforceApprovals = false
     test.addSession("ses_a", "A")
     await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
     const b = [...test.sessions.values()].find((session) => session.title === "B")!
@@ -1969,6 +1977,106 @@ describe("v2 supervision and consultation", () => {
       { sessionID: b.id },
     )
     expect(escalation.content).toContain("only the spawn parent")
+  })
+})
+
+describe("v2 approvals", () => {
+  const approvalID = (content: string) => content.match(/APPROVAL_ID\t(\S+)/)?.[1] ?? ""
+
+  async function setupChain() {
+    const test = await boot()
+    test.addSession("ses_root", "Root")
+    await test.tools.spawn.execute({ title: "A" }, { sessionID: "ses_root" })
+    const a = [...test.sessions.values()].find((session) => session.title === "A")!
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: a.id })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+    return { test, a, b }
+  }
+
+  it("requires an approval for close and binds it to the target", async () => {
+    const { test, a, b } = await setupChain()
+    const consult = await test.tools.send.execute(
+      { to: a.id, text: "consult while supervised", kind: "request", msg_id: "msg_consult" },
+      { sessionID: b.id },
+    )
+    expect(consult.content).toContain("letter delivered")
+    await test.tools.spawn.execute({ title: "C" }, { sessionID: a.id })
+    const c = [...test.sessions.values()].find((session) => session.title === "C")!
+
+    const denied = await test.tools.close.execute({ sessionID: b.id }, { sessionID: a.id })
+    expect(denied.content).toContain("approval required")
+
+    const requested = await test.tools.request_approval.execute(
+      { operation: "close", resource: b.id, parameters: {} },
+      { sessionID: a.id },
+    )
+    const id = approvalID(requested.content)
+    expect(id).toStartWith("apr_")
+    expect(requested.content).toContain("STATUS\tpending")
+
+    const self = await test.tools.approve.execute({ approval_id: id }, { sessionID: a.id })
+    expect(self.content).toContain("not authorized")
+
+    const approved = await test.tools.approve.execute({ approval_id: id }, { sessionID: "ses_root" })
+    expect(approved.content).toContain("APPROVED")
+
+    // The same approval cannot close a different session.
+    const mismatch = await test.tools.close.execute(
+      { sessionID: c.id, approval_id: id },
+      { sessionID: a.id },
+    )
+    expect(mismatch.content).toContain("hash does not match")
+    expect(test.sessions.has(c.id)).toBe(true)
+
+    const closed = await test.tools.close.execute(
+      { sessionID: b.id, approval_id: id },
+      { sessionID: a.id },
+    )
+    expect(closed.content).toContain(`closed ${b.id}`)
+    expect(test.sessions.has(b.id)).toBe(false)
+
+    const reuse = await test.tools.consume_approval.execute({ approval_id: id }, { sessionID: a.id })
+    expect(reuse.content).toContain("approval is consumed")
+
+    const audit = await test.tools.audit.execute({}, { sessionID: a.id })
+    expect(audit.content).toContain("approval_request")
+    expect(audit.content).toContain("approval_consume")
+    const approverAudit = await test.tools.audit.execute({}, { sessionID: "ses_root" })
+    expect(approverAudit.content).toContain("approval_approve")
+  })
+
+  it("rejects expired approvals without executing the operation", async () => {
+    const { test, a, b } = await setupChain()
+    const requested = await test.tools.request_approval.execute(
+      { operation: "close", resource: b.id, parameters: {} },
+      { sessionID: a.id },
+    )
+    const id = approvalID(requested.content)
+    await test.tools.approve.execute({ approval_id: id }, { sessionID: "ses_root" })
+    const record = test.storage.get(`approval/${id}`) as any
+    record.expiresAt = Date.now() - 1000
+    test.storage.set(`approval/${id}`, record)
+
+    const closed = await test.tools.close.execute(
+      { sessionID: b.id, approval_id: id },
+      { sessionID: a.id },
+    )
+    expect(closed.content).toContain("approval has expired")
+    expect(test.sessions.has(b.id)).toBe(true)
+  })
+
+  it("lists external operations with an enforceable flag and warning", async () => {
+    const { test, a } = await setupChain()
+    const host = await test.tools.request_approval.execute(
+      { operation: "host.deploy", resource: "production" },
+      { sessionID: a.id },
+    )
+    expect(host.content).toContain("ENFORCEABLE\tnone")
+    expect(host.content).toContain("not enforceable by Postal")
+
+    const relations = await test.tools.relations.execute({}, { sessionID: a.id })
+    expect(relations.content).toContain("host.deploy\tnone\tyes\tapproval required but not enforceable by Postal")
+    expect(relations.content).toContain("close\tpostal\tyes")
   })
 })
 
