@@ -1,0 +1,20 @@
+sequenceDiagram
+  autonumber
+  title: Worker spawn
+  participant A as Caller AI
+  participant P as postal_spawn Tool
+  participant O as OpenCode Runtime
+  participant K as Plugin KV
+  participant W as Worker Session
+
+  A->>P: postal_spawn with options
+  P->>P: parse model and permissions
+  P->>O: session.create
+  O-->>P: new ses_ id
+  alt autoPair enabled
+    P->>K: add peers both sides
+    P->>A: refresh peer note
+    P->>W: refresh peer note
+  end
+  P-->>A: spawned id and status
+  Note left of A: use postal_send to assign work

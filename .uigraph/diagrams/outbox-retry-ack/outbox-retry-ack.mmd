@@ -1,0 +1,29 @@
+sequenceDiagram
+  title Outbox retry and ACK
+  participant SenderAI as Sender AI
+  participant postal_sendTool as postal_send Tool
+  participant OutboxKV as Outbox KV
+  participant RetryScanner as Retry Scanner
+  participant PeerSession as Peer Session
+  autonumber 1 3
+  SenderAI->>postal_sendTool: postal_send letter
+  postal_sendTool->>OutboxKV: mark delivered
+  postal_sendTool->>OutboxKV: write pending record
+  alt delivery succeeds
+    PeerSession->>postal_sendTool: reply with reply_to
+    postal_sendTool->>PeerSession: attempt steer
+    postal_sendTool->>OutboxKV: mark acked
+  else delivery fails
+    postal_sendTool->>OutboxKV: pending with backoff
+    loop every 15 seconds
+      RetryScanner->>OutboxKV: list due records
+      RetryScanner->>PeerSession: retry steer
+      alt retry succeeds
+        RetryScanner->>OutboxKV: mark delivered
+      else attempts below six
+        RetryScanner->>OutboxKV: schedule next backoff
+      else attempts exhausted
+        RetryScanner->>OutboxKV: mark failed
+      end
+    end
+  end

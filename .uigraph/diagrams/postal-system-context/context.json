@@ -1,0 +1,52 @@
+{
+  "name": "Postal System Context",
+  "description": "The Postal server and TUI plugins inside OpenCode, with the runtime, sessions, and plugin storage they use.",
+  "nodes": {
+    "human": {
+      "name": "Human",
+      "data": {
+        "Role": { "type": "Text Input", "value": "Writes prompts and runs Ctrl+P commands" }
+      }
+    },
+    "session_a": {
+      "name": "OpenCode Session A",
+      "data": {
+        "Identity": { "type": "Text Input", "value": "ses_... with its own model, agent, and transcript" }
+      }
+    },
+    "session_b": {
+      "name": "OpenCode Session B",
+      "data": {
+        "Identity": { "type": "Text Input", "value": "Peer session with its own model, agent, and transcript" }
+      }
+    },
+    "postal_server": {
+      "name": "Postal Server Plugin",
+      "data": {
+        "Entry": { "type": "Text Input", "value": "index.ts" },
+        "Provides": { "type": "Text Input", "value": "tools, RPC, prompt hook, retry timer" }
+      }
+    },
+    "postal_tui": {
+      "name": "Postal TUI",
+      "data": {
+        "Entry": { "type": "Text Input", "value": "tui.tsx" },
+        "Provides": { "type": "Text Input", "value": "Ctrl+P commands, picker, footer" }
+      }
+    },
+    "kv": {
+      "type": "shape",
+      "shape": "cylinder",
+      "name": "Plugin KV Storage",
+      "data": {
+        "Keys": { "type": "Text Input", "value": "peers/, rally/, outbox/, presence/" }
+      }
+    },
+    "runtime": {
+      "name": "OpenCode Runtime",
+      "data": {
+        "API": { "type": "Text Input", "value": "session.prompt, session.create, storage, rpc" }
+      }
+    }
+  }
+}

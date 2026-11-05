@@ -1,0 +1,30 @@
+{
+  "name": "postal_send Rally Context",
+  "description": "Two sessions exchanging letters through the postal_send tool under one shared rally counter.",
+  "nodes": {
+    "participant-A": {
+      "name": "Session A",
+      "data": {
+        "Role": { "type": "Text Input", "value": "Initiates the exchange" }
+      }
+    },
+    "participant-T": {
+      "name": "postal_send Tool",
+      "data": {
+        "Functions": { "type": "Text Input", "value": "dispatchLetter, nextRally, postOnly" }
+      }
+    },
+    "participant-K": {
+      "name": "Plugin KV",
+      "data": {
+        "Keys": { "type": "Text Input", "value": "rally/<min>:<max>, msg/<msgID>" }
+      }
+    },
+    "participant-B": {
+      "name": "Session B",
+      "data": {
+        "Role": { "type": "Text Input", "value": "Replies with another postal_send" }
+      }
+    }
+  }
+}

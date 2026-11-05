@@ -1,0 +1,10 @@
+flowchart LR
+  human[Human] -->|writes prompt| session_a[Session A]
+  human -->|Ctrl+P commands| postal_tui[Postal TUI]
+  session_a -->|prompt hook| postal_server[Postal Server Plugin]
+  session_b[Session B] -->|postal_send replies| postal_server
+  postal_tui -->|RPC and status| postal_server
+  postal_server -->|peers outbox rally| kv[(Plugin KV Storage)]
+  postal_server -->|steers prompts| runtime[OpenCode Runtime]
+  runtime -->|delivers letters| session_b
+  postal_tui -->|footer identity| human

@@ -1,0 +1,777 @@
+{
+  "nodes": {
+    "sequence-block-block-0": {
+      "type": "group",
+      "name": "alt over rally limit",
+      "style": {
+        "width": 1660,
+        "height": 586
+      },
+      "___internal": {
+        "source": "mermaid",
+        "backgroundColor": "rgba(99, 102, 241, 0.06)",
+        "borderColor": "#6366F1",
+        "autoLayout": false,
+        "sequenceBlock": {
+          "type": "alt",
+          "label": "over rally limit",
+          "depth": 0,
+          "startRow": 4,
+          "endRow": 11,
+          "sections": [
+            {
+              "label": "over rally limit",
+              "startRow": 4,
+              "endRow": 4
+            },
+            {
+              "label": "within limit",
+              "startRow": 5,
+              "endRow": 11
+            }
+          ]
+        }
+      },
+      "___position": {
+        "x": 136,
+        "y": 308
+      }
+    },
+    "participant-Human": {
+      "type": "sequenceParticipant",
+      "name": "Human",
+      "data": {
+        "Action": {
+          "type": "Text Input",
+          "value": "Writes @ses_... in a prompt"
+        }
+      },
+      "___internal": {
+        "source": "mermaid",
+        "participantType": "participant",
+        "rowCount": 12,
+        "rowHeight": 64,
+        "rowYs": [
+          72,
+          136,
+          200,
+          264,
+          376,
+          462,
+          526,
+          590,
+          654,
+          718,
+          782,
+          846
+        ],
+        "lifelineHeight": 894,
+        "activations": [],
+        "links": [],
+        "label": "Human"
+      },
+      "___position": {
+        "x": 175,
+        "y": 0
+      }
+    },
+    "participant-SessionA": {
+      "type": "sequenceParticipant",
+      "name": "Session A",
+      "data": {
+        "Entry": {
+          "type": "Text Input",
+          "value": "Prompt admission hook in index.ts"
+        }
+      },
+      "___internal": {
+        "source": "mermaid",
+        "participantType": "participant",
+        "rowCount": 12,
+        "rowHeight": 64,
+        "rowYs": [
+          72,
+          136,
+          200,
+          264,
+          376,
+          462,
+          526,
+          590,
+          654,
+          718,
+          782,
+          846
+        ],
+        "lifelineHeight": 894,
+        "activations": [],
+        "links": [],
+        "label": "Session A"
+      },
+      "___position": {
+        "x": 535,
+        "y": 0
+      }
+    },
+    "participant-PostalPlugin": {
+      "type": "sequenceParticipant",
+      "name": "Postal Plugin",
+      "data": {
+        "Functions": {
+          "type": "Text Input",
+          "value": "relayMention, nextRally, postOnly"
+        }
+      },
+      "___internal": {
+        "source": "mermaid",
+        "participantType": "participant",
+        "rowCount": 12,
+        "rowHeight": 64,
+        "rowYs": [
+          72,
+          136,
+          200,
+          264,
+          376,
+          462,
+          526,
+          590,
+          654,
+          718,
+          782,
+          846
+        ],
+        "lifelineHeight": 894,
+        "activations": [],
+        "links": [],
+        "label": "Postal Plugin"
+      },
+      "___position": {
+        "x": 895,
+        "y": 0
+      }
+    },
+    "participant-PluginKV": {
+      "type": "sequenceParticipant",
+      "name": "Plugin KV",
+      "data": {
+        "Keys": {
+          "type": "Text Input",
+          "value": "rally/<min>:<max>"
+        }
+      },
+      "___internal": {
+        "source": "mermaid",
+        "participantType": "participant",
+        "rowCount": 12,
+        "rowHeight": 64,
+        "rowYs": [
+          72,
+          136,
+          200,
+          264,
+          376,
+          462,
+          526,
+          590,
+          654,
+          718,
+          782,
+          846
+        ],
+        "lifelineHeight": 894,
+        "activations": [],
+        "links": [],
+        "label": "Plugin KV"
+      },
+      "___position": {
+        "x": 1255,
+        "y": 0
+      }
+    },
+    "participant-SessionB": {
+      "type": "sequenceParticipant",
+      "name": "Session B",
+      "data": {
+        "Note": {
+          "type": "Text Input",
+          "value": "Replies with postal_send, not a normal message"
+        }
+      },
+      "___internal": {
+        "source": "mermaid",
+        "participantType": "participant",
+        "rowCount": 12,
+        "rowHeight": 64,
+        "rowYs": [
+          72,
+          136,
+          200,
+          264,
+          376,
+          462,
+          526,
+          590,
+          654,
+          718,
+          782,
+          846
+        ],
+        "lifelineHeight": 894,
+        "activations": [],
+        "links": [],
+        "label": "Session B"
+      },
+      "___position": {
+        "x": 1615,
+        "y": 0
+      }
+    },
+    "note-7": {
+      "type": "shape",
+      "name": "relay=true prevents loops",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 48,
+        "fill": "#FEF3C7",
+        "stroke": "#F59E0B",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "textColor": "#1F2937",
+        "sequenceNote": {
+          "placement": "right of",
+          "participants": [
+            "B"
+          ],
+          "row": 8
+        }
+      },
+      "___position": {
+        "x": 1644,
+        "y": 630
+      }
+    },
+    "message-0": {
+      "type": "shape",
+      "name": "prompt with @ses_B",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 48,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 1
+      },
+      "___position": {
+        "x": 290,
+        "y": 48
+      }
+    },
+    "message-1": {
+      "type": "shape",
+      "name": "prompt admission hook",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 48,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 2
+      },
+      "___position": {
+        "x": 650,
+        "y": 112
+      }
+    },
+    "message-2": {
+      "type": "shape",
+      "name": "read rally window",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 48,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 3
+      },
+      "___position": {
+        "x": 1010,
+        "y": 176
+      }
+    },
+    "message-3": {
+      "type": "shape",
+      "name": "current count",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 32,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 4
+      },
+      "___position": {
+        "x": 1010,
+        "y": 248
+      }
+    },
+    "message-4": {
+      "type": "shape",
+      "name": "drop with warning",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 48,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 5
+      },
+      "___position": {
+        "x": 650,
+        "y": 352
+      }
+    },
+    "message-5": {
+      "type": "shape",
+      "name": "strip mention tokens",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 48,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 6
+      },
+      "___position": {
+        "x": 948,
+        "y": 438
+      }
+    },
+    "message-6": {
+      "type": "shape",
+      "name": "steer letter",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 32,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 7
+      },
+      "___position": {
+        "x": 1190,
+        "y": 574
+      }
+    },
+    "message-8": {
+      "type": "shape",
+      "name": "postal_send reply",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 48,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 8
+      },
+      "___position": {
+        "x": 1190,
+        "y": 694
+      }
+    },
+    "message-9": {
+      "type": "shape",
+      "name": "steer reply",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 32,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 9
+      },
+      "___position": {
+        "x": 650,
+        "y": 766
+      }
+    },
+    "message-10": {
+      "type": "shape",
+      "name": "reply in transcript",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 48,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 10
+      },
+      "___position": {
+        "x": 290,
+        "y": 822
+      }
+    },
+    "sequence-title": {
+      "type": "text",
+      "value": "Mention delivery",
+      "___internal": {
+        "source": "mermaid"
+      },
+      "___position": {
+        "x": 0,
+        "y": -70
+      }
+    }
+  },
+  "edges": {
+    "participant-Human-message-0": {
+      "type": "smoothstep",
+      "sourceHandle": "row-0-right-source",
+      "targetHandle": "target-left",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-0-participant-SessionA": {
+      "type": "smoothstep",
+      "sourceHandle": "source-right",
+      "targetHandle": "row-0-left-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "participant-SessionA-message-1": {
+      "type": "smoothstep",
+      "sourceHandle": "row-1-right-source",
+      "targetHandle": "target-left",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-1-participant-PostalPlugin": {
+      "type": "smoothstep",
+      "sourceHandle": "source-right",
+      "targetHandle": "row-1-left-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "participant-PostalPlugin-message-2": {
+      "type": "smoothstep",
+      "sourceHandle": "row-2-right-source",
+      "targetHandle": "target-left",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-2-participant-PluginKV": {
+      "type": "smoothstep",
+      "sourceHandle": "source-right",
+      "targetHandle": "row-2-left-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "participant-PluginKV-message-3": {
+      "type": "smoothstep",
+      "sourceHandle": "row-3-left-source",
+      "targetHandle": "target-right",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2,
+        "strokeStyle": "dashed"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-3-participant-PostalPlugin": {
+      "type": "smoothstep",
+      "sourceHandle": "source-left",
+      "targetHandle": "row-3-right-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2,
+        "strokeStyle": "dashed"
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "participant-PostalPlugin-message-4": {
+      "type": "smoothstep",
+      "sourceHandle": "row-4-left-source",
+      "targetHandle": "target-right",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2,
+        "strokeStyle": "dashed"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-4-participant-SessionA": {
+      "type": "smoothstep",
+      "sourceHandle": "source-left",
+      "targetHandle": "row-4-right-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2,
+        "strokeStyle": "dashed"
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "participant-PostalPlugin-message-5": {
+      "type": "smoothstep",
+      "sourceHandle": "row-5-right-source",
+      "targetHandle": "target-top",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-5-participant-PostalPlugin": {
+      "type": "smoothstep",
+      "sourceHandle": "source-bottom",
+      "targetHandle": "row-6-right-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "participant-PostalPlugin-message-6": {
+      "type": "smoothstep",
+      "sourceHandle": "row-7-right-source",
+      "targetHandle": "target-left",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-6-participant-SessionB": {
+      "type": "smoothstep",
+      "sourceHandle": "source-right",
+      "targetHandle": "row-7-left-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "participant-SessionB-message-8": {
+      "type": "smoothstep",
+      "sourceHandle": "row-9-left-source",
+      "targetHandle": "target-right",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-8-participant-PostalPlugin": {
+      "type": "smoothstep",
+      "sourceHandle": "source-left",
+      "targetHandle": "row-9-right-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "participant-PostalPlugin-message-9": {
+      "type": "smoothstep",
+      "sourceHandle": "row-10-left-source",
+      "targetHandle": "target-right",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-9-participant-SessionA": {
+      "type": "smoothstep",
+      "sourceHandle": "source-left",
+      "targetHandle": "row-10-right-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "participant-SessionA-message-10": {
+      "type": "smoothstep",
+      "sourceHandle": "row-11-left-source",
+      "targetHandle": "target-right",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2,
+        "strokeStyle": "dashed"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-10-participant-Human": {
+      "type": "smoothstep",
+      "sourceHandle": "source-left",
+      "targetHandle": "row-11-right-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2,
+        "strokeStyle": "dashed"
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    }
+  }
+}

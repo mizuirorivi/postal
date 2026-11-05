@@ -1,0 +1,23 @@
+sequenceDiagram
+  autonumber
+  title: Peer connect
+  participant U as Human
+  participant T as Postal TUI
+  participant S as Postal Server
+  participant K as Plugin KV
+  participant A as Session A
+  participant B as Session B
+
+  U->>T: Postal connect command
+  T->>T: fuzzy session picker
+  T->>S: rpc connect
+  alt RPC unavailable
+    T->>A: postal.connect handshake
+    A->>S: prompt admission hook
+  end
+  S->>S: validate both sessions
+  S->>K: add peers both sides
+  S->>A: refresh peer note
+  S->>B: refresh peer note
+  S-->>T: peer result
+  T-->>U: green footer update

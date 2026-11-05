@@ -1,0 +1,24 @@
+sequenceDiagram
+  title Mention delivery
+  participant Human
+  participant SessionA as Session A
+  participant PostalPlugin as Postal Plugin
+  participant PluginKV as Plugin KV
+  participant SessionB as Session B
+  autonumber 1 1
+  Human->>SessionA: prompt with @ses_B
+  SessionA->>PostalPlugin: prompt admission hook
+  PostalPlugin->>PluginKV: read rally window
+  PluginKV-->>PostalPlugin: current count
+  alt over rally limit
+    PostalPlugin-->>SessionA: drop with warning
+  else within limit
+    PostalPlugin->>PostalPlugin: strip mention tokens
+    PostalPlugin->>PostalPlugin: sign letter (HMAC)
+    PostalPlugin->>SessionB: steer letter
+    SessionB->>PostalPlugin: verify signature at admission
+    Note right of SessionB: relay=true prevents loops
+    SessionB->>PostalPlugin: postal_send reply (signed)
+    PostalPlugin->>SessionA: steer reply (verified)
+    SessionA-->>Human: reply in transcript
+  end

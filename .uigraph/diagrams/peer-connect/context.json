@@ -1,0 +1,42 @@
+{
+  "name": "Peer Connect Context",
+  "description": "The Ctrl+P connect command, its RPC and prompt-handshake paths, and the bidirectional peer records it writes.",
+  "nodes": {
+    "participant-U": {
+      "name": "Human",
+      "data": {
+        "Action": { "type": "Text Input", "value": "Runs Postal: Select peer session" }
+      }
+    },
+    "participant-T": {
+      "name": "Postal TUI",
+      "data": {
+        "Entry": { "type": "Text Input", "value": "tui.tsx connect()" }
+      }
+    },
+    "participant-S": {
+      "name": "Postal Server",
+      "data": {
+        "Entry": { "type": "Text Input", "value": "pair(), rpc.connect, prompt hook" }
+      }
+    },
+    "participant-K": {
+      "name": "Plugin KV",
+      "data": {
+        "Keys": { "type": "Text Input", "value": "peers/<sessionID>" }
+      }
+    },
+    "participant-A": {
+      "name": "Session A",
+      "data": {
+        "Role": { "type": "Text Input", "value": "The session running the command" }
+      }
+    },
+    "participant-B": {
+      "name": "Session B",
+      "data": {
+        "Role": { "type": "Text Input", "value": "The selected peer session" }
+      }
+    }
+  }
+}

@@ -1,0 +1,147 @@
+# Postal service overview
+
+Postal is an OpenCode v2 plugin that turns separate sessions into a mail network.
+Each session keeps its own model, agent, permissions, and transcript; Postal only
+forwards letters between them.
+
+The repository has no build step and no npm runtime dependencies. OpenCode loads
+the TypeScript sources directly.
+
+## Runtime surface
+
+`index.ts` exports the server plugin (`id: "postal"`, `setup`). At startup it:
+
+- registers the `postal` RPC contract: `connect`, `disconnect`, `status`, `presence`
+- registers the bundled agent skill from `skills/postal/SKILL.md`
+- registers the `postal_*` tools for directory lookup, peer listing, sending,
+  broadcast, outbox inspection, retry, claims, spawn, interrupt, close, and
+  HMAC key rotation
+- starts a 15-second outbox retry scanner
+- installs the prompt hook for `@ses_` mentions, HMAC verification, task
+  authorization, relay ACK marking, and the TUI connect/disconnect/reset
+  handshake
+
+`tui.tsx` exports the TUI plugin: Ctrl+P commands, the fuzzy session picker, the
+prompt footer, and peer coloring. `sessions.ts` holds the testable new/close
+session flows, `status.ts` resolves the current session identity, `rpc.ts`
+defines the RPC contract, `lock.ts` serializes per-key work, and `fuzzy.ts` is the
+picker matcher.
+
+## State in plugin KV storage
+
+| Key | Purpose |
+| --- | --- |
+| `peers/<sessionID>` | Array of connected peers (`{ id, title }`) |
+| `peer/<sessionID>` | Legacy single-peer record, migrated on first read |
+| `parent/<sessionID>`, `children/<sessionID>` | Spawn hierarchy used by interrupt/close authorization and orphan handling |
+| `rally/<min>:<max>` | Shared rally counter and window start for a session pair |
+| `last/<min>:<max>` | Timestamp of the last letter in a pair |
+| `msg/<msgID>` | Delivered-message marker for idempotency |
+| `outbox/index`, `outbox/<msgID>` | Persistent delivery queue and retry metadata |
+| `claim/<scope>` | Advisory claim with owner and expiry |
+| `presence/<sessionID>` | TUI-reported session state, ignored after 30 seconds |
+| `hmac/<min>:<max>` | Current and previous HMAC keys for a pair, with key IDs and grace expiry |
+
+## Delivery model
+
+Every delivery uses `delivery: "steer"`; Postal never queues a reply or notice.
+The receiver gets a `[postal]` letter with the sender label, rally position,
+`msg_id`, kind, optional task/reply IDs, envelope details, and an instruction to
+reply with `postal_send`. Relay deliveries carry `metadata.postal.relay = true`
+and the prompt hook ignores them, so they are not forwarded again.
+
+- **Mention mode.** A prompt containing `@ses_...` is forwarded immediately and
+  the sender's turn ends. The receiver answers with `postal_send`, which starts
+  the sender's next turn.
+- **Tool mode.** `postal_send` resolves the target, checks idempotency, counts the
+  rally, writes an outbox record, and attempts delivery. Without `to`, exactly
+  one connected peer is required.
+- **Rally limit.** The counter is keyed by the sorted session pair and defaults
+  to 30 letters per 10-minute window. Sends beyond the limit are rejected unless
+  `queueOnLimit` is set; a queued letter is released after the window.
+- **Retry.** Failed deliveries retry after 1s, 2s, 4s, and so on, up to six
+  attempts and a five-minute cap, driven by the 15-second scanner.
+- **ACK.** A reply that includes `reply_to: <msg_id>` marks the original outbox
+  record `acked` when the relay reaches the sender. This is application-level,
+  not transport-level, acknowledgement.
+- **Artifacts.** For letters with artifacts, Postal reports `ok`, `missing`, or
+  `sha256 mismatch`; commands are listed, never executed.
+- **HMAC Phase 1.** Pairing creates a 32-byte HMAC-SHA256 key per pair. Every
+  letter is signed over key ID, `issued_at`, and the rendered letter. The
+  receiver verifies within `hmacWindowSeconds` (default 120) and clears the body
+  with a `reason` in `postal` metadata when the signature is missing, stale, or
+  invalid. `kind: "task"` is accepted only from the target's parent or an
+  ancestor. `postal_rekey` rotates a key; the old key verifies for
+  `keyGraceHours` (default 24). Keys are same-location only in Phase 1.
+- **Broadcast.** Each peer gets its own outbox record and rally accounting, with
+  a per-peer suffix on the idempotency key.
+
+## Pairing, spawning, and lifecycle
+
+Pairing writes the peer to both sessions and refreshes an instruction note when
+the runtime exposes instruction entries. Connecting a peer preserves existing
+ones; disconnect removes one peer or all of them. `peerStatus` drops records
+whose session no longer exists.
+
+`postal_spawn` calls `ctx.session.create` with the requested title, model,
+agent, directory, and permissions, records the parent/child relationship, and
+pairs the new session when `autoPair` is true (the default). The worker stays
+idle until a letter arrives.
+
+`postal_interrupt` and `postal_close` are limited to the direct parent session by
+default; `allowAncestorCommands: true` extends this to ancestors. When a parent
+closes, `orphanPolicy` decides what happens to its children:
+
+- `reparent` (default): the grandparent adopts them and is notified with a
+  `kind: "system"` letter
+- `terminate`: the descendant subtree is stopped and deleted
+- `detach`: parent links are removed and nobody can close the orphans
+
+## Configuration
+
+Plugin options are read from the plugin entry in `opencode.json(c)`:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `maxRally` | 30 | Letters per conversation window |
+| `rallyWindowMinutes` | 10 | Rolling rally window |
+| `allowAncestorCommands` | false | Let any ancestor interrupt/close a descendant |
+| `orphanPolicy` | `reparent` | Child handling when a parent closes |
+| `hmacWindowSeconds` | 120 | Accepted `issued_at` skew (30–3600) |
+| `keyGraceHours` | 24 | Old-key verification grace after `postal_rekey` (1–168) |
+
+## Operational limits
+
+- Outbox state lives in the per-location plugin KV table. It is not a global
+  distributed queue; cross-project delivery still needs a reachable target.
+- ACK depends on the receiver passing `reply_to`; there is no runtime-level
+  acknowledgement.
+- Claims are advisory and can be ignored; filesystem permissions remain the real
+  enforcement boundary.
+- `postal_status` reports peers, rally budget, last letter, outbox count, and the
+  session parent. It cannot see true busy/idle in the server plugin API; the TUI
+  publishes presence separately.
+- Mail bodies are untrusted. HMAC Phase 1 authenticates the pair, not intent: a
+  compromised peer with the key can sign a malicious task. Task letters are
+  limited to parent/ancestor sessions. Keys live in the per-location KV and are
+  not shared across locations yet; pair only trusted sessions and use
+  permissions or separate projects for isolation.
+
+## Files
+
+| File | Responsibility |
+| --- | --- |
+| `index.ts` | Server plugin: tools, RPC, prompt hook, KV state, delivery |
+| `tui.tsx` | TUI commands, picker, footer, peer colors |
+| `sessions.ts` | New/close/delete session flows |
+| `status.ts` | Route and tab identity for the footer |
+| `rpc.ts` | `postal.connect` / `disconnect` / `status` / `presence` contract |
+| `lock.ts` | Per-key serialization helper |
+| `fuzzy.ts` | Fuzzy matcher for the session picker |
+| `skills/postal/SKILL.md` | Agent-facing usage guide |
+
+## Tests
+
+`bun test` runs the Bun test suite under `test/`: multi-peer storage, async
+delivery, session lifecycle, footer identity, HMAC verification/task
+authorization, and headless server behaviour.

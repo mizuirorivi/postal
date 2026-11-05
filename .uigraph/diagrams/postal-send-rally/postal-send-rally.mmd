@@ -1,0 +1,19 @@
+sequenceDiagram
+  autonumber
+  title: postal_send rally
+  participant A as Session A
+  participant T as postal_send Tool
+  participant K as Plugin KV
+  participant B as Session B
+
+  loop bounded by rally counter
+    A->>T: postal_send letter
+    T->>K: increment rally count
+    K-->>T: count within limit
+    T->>B: steer letter
+    Note right of B: reply with postal_send
+    B->>T: postal_send reply
+    T->>K: increment rally count
+    T->>A: steer reply
+  end
+  Note over A,B: 30 letters per 10 minutes

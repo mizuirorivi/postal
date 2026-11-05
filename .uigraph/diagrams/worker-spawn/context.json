@@ -1,0 +1,36 @@
+{
+  "name": "Worker Spawn Context",
+  "description": "postal_spawn creates an OpenCode session, optionally pairs it, and returns its ID for postal_send.",
+  "nodes": {
+    "participant-A": {
+      "name": "Caller AI",
+      "data": {
+        "Role": { "type": "Text Input", "value": "Calls postal_spawn and then sends work" }
+      }
+    },
+    "participant-P": {
+      "name": "postal_spawn Tool",
+      "data": {
+        "Functions": { "type": "Text Input", "value": "parseModel, session.create, pair" }
+      }
+    },
+    "participant-O": {
+      "name": "OpenCode Runtime",
+      "data": {
+        "API": { "type": "Text Input", "value": "ctx.session.create" }
+      }
+    },
+    "participant-K": {
+      "name": "Plugin KV",
+      "data": {
+        "Keys": { "type": "Text Input", "value": "peers/<sessionID>" }
+      }
+    },
+    "participant-W": {
+      "name": "Worker Session",
+      "data": {
+        "State": { "type": "Text Input", "value": "Idle until a letter arrives" }
+      }
+    }
+  }
+}

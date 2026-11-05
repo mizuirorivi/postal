@@ -1,0 +1,57 @@
+version: 1
+
+service:
+  name: Postal
+  category: Developer Tool
+  description: Session-to-session mail for OpenCode with @mentions, tools, multi-peer pairing, and a bounded AI-to-AI rally.
+  repository:
+    provider: github
+    url: https://github.com/mizuirorivi/postal.git
+  ownership:
+    team: unassigned
+  labels:
+    - opencode
+    - plugin
+    - typescript
+    - messaging
+
+dependencies:
+  - name: opencode-plugin-runtime
+    service: OpenCode
+    direction: downstream
+    criticality: hard
+    description: Uses the host session prompt/steer, session create/remove, KV storage, RPC, and tool/skill transforms.
+
+architectureDiagrams:
+  - name: Postal System Context
+    path: .uigraph/diagrams/postal-system-context/postal-system-context.mmd
+    contextPath: .uigraph/diagrams/postal-system-context/context.json
+  - name: Mention Delivery
+    path: .uigraph/diagrams/mention-delivery/mention-delivery.mmd
+    contextPath: .uigraph/diagrams/mention-delivery/context.json
+  - name: postal_send Rally
+    path: .uigraph/diagrams/postal-send-rally/postal-send-rally.mmd
+    contextPath: .uigraph/diagrams/postal-send-rally/context.json
+  - name: Outbox Retry and ACK
+    path: .uigraph/diagrams/outbox-retry-ack/outbox-retry-ack.mmd
+    contextPath: .uigraph/diagrams/outbox-retry-ack/context.json
+  - name: Peer Connect
+    path: .uigraph/diagrams/peer-connect/peer-connect.mmd
+    contextPath: .uigraph/diagrams/peer-connect/context.json
+  - name: Worker Spawn
+    path: .uigraph/diagrams/worker-spawn/worker-spawn.mmd
+    contextPath: .uigraph/diagrams/worker-spawn/context.json
+
+docs:
+  - name: Postal Service Overview
+    path: .uigraph/docs/postal-service.md
+    fileType: markdown
+    description: Runtime model, KV state, delivery flows, configuration, and operational limits.
+  - name: README
+    path: README.md
+    fileType: markdown
+    description: Product overview, quick start, usage, configuration, and security model.
+  - name: Postal Agent Skill
+    path: skills/postal/SKILL.md
+    fileType: markdown
+    description: Agent-facing guide for mentions, postal_send, rallies, and untrusted mail.
