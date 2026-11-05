@@ -36,8 +36,9 @@ picker matcher.
 | `parent/<sessionID>`, `children/<sessionID>` | Spawn hierarchy used by interrupt/close authorization and orphan handling |
 | `rally/<min>:<max>` | Shared rally counter and window start for a session pair |
 | `last/<min>:<max>` | Timestamp of the last letter in a pair |
-| `msg/<msgID>` | Delivered-message marker for idempotency |
-| `outbox/index`, `outbox/<msgID>` | Persistent delivery queue and retry metadata |
+| `msg/<from>/<msgID>` | Sender-scoped delivered-message marker for idempotency |
+| `outbox/index`, `outbox/<from>/<msgID>` | Sender-scoped delivery queue and retry metadata |
+| `receipt/index`, `receipt/<from>/<to>/<msgID>` | Receiver admission decision (`accepted`/`rejected`), reason, and task authorizer |
 | `claim/<scope>` | Advisory claim with owner and expiry |
 | `presence/<sessionID>` | TUI-reported session state, ignored after 30 seconds |
 | `hmac/<min>:<max>` | Current and previous HMAC keys for a pair, with key IDs and grace expiry |
@@ -50,9 +51,10 @@ The receiver gets a `[postal]` letter with the sender label, rally position,
 reply with `postal_send`. Relay deliveries carry `metadata.postal.relay = true`
 and the prompt hook ignores them, so they are not forwarded again.
 
-- **Mention mode.** A prompt containing `@ses_...` is forwarded immediately and
-  the sender's turn ends. The receiver answers with `postal_send`, which starts
-  the sender's next turn.
+- **Mention mode.** A prompt that starts with `@ses_...` is forwarded immediately
+  and the sender's turn ends. Mid-sentence, documentation, and code-fence
+  mentions are ordinary text. The receiver answers with `postal_send`, which
+  starts the sender's next turn.
 - **Tool mode.** `postal_send` resolves the target, checks idempotency, counts the
   rally, writes an outbox record, and attempts delivery. Without `to`, exactly
   one connected peer is required.
@@ -61,18 +63,27 @@ and the prompt hook ignores them, so they are not forwarded again.
   `queueOnLimit` is set; a queued letter is released after the window.
 - **Retry.** Failed deliveries retry after 1s, 2s, 4s, and so on, up to six
   attempts and a five-minute cap, driven by the 15-second scanner.
+- **Receipts.** On admission the receiver writes `receipt/<from>/<to>/<msg_id>`
+  with `accepted` or `rejected` (and a reason). Only authenticated decisions are
+  recorded: a valid signature, `invalid_signature` after a matching key ID, or
+  `unauthorized_task`. `postal_inbox` reconciles receipts into the sender's
+  outbox and sets `rejected` plus `lastError`.
 - **ACK.** A reply that includes `reply_to: <msg_id>` marks the original outbox
-  record `acked` when the relay reaches the sender. This is application-level,
-  not transport-level, acknowledgement.
+  record `acked` when the relay reaches the sender. Admission alone is not an
+  ACK; the watchdog keeps watching delivered tasks until a reply arrives. This is
+  application-level, not transport-level, acknowledgement.
 - **Artifacts.** For letters with artifacts, Postal reports `ok`, `missing`, or
   `sha256 mismatch`; commands are listed, never executed.
 - **HMAC Phase 1.** Pairing creates a 32-byte HMAC-SHA256 key per pair. Every
-  letter is signed over key ID, `issued_at`, and the rendered letter. The
-  receiver verifies within `hmacWindowSeconds` (default 120) and clears the body
-  with a `reason` in `postal` metadata when the signature is missing, stale, or
-  invalid. `kind: "task"` is accepted only from the target's parent or an
-  ancestor. `postal_rekey` rotates a key; the old key verifies for
-  `keyGraceHours` (default 24). Keys are same-location only in Phase 1.
+  letter is signed over a v2 canonical payload: key ID, `issued_at`, `from`,
+  `to`, `msg_id`, `kind`, `task_id`, `reply_to`, and the rendered letter. The
+  receiver rebuilds the payload from metadata, verifies within
+  `hmacWindowSeconds` (default 120), and clears the body with a `reason` when the
+  signature is missing, stale, invalid, or from an unsupported version.
+  `kind: "task"` is accepted only from the target's parent or an ancestor, and
+  the receipt records the authorizing ancestor. `postal_rekey` rotates a key;
+  the old key verifies for `keyGraceHours` (default 24). Keys are same-location
+  only in Phase 1.
 - **Broadcast.** Each peer gets its own outbox record and rally accounting, with
   a per-peer suffix on the idempotency key.
 - **Watchdog.** Delivered `kind: "task"` records that remain unacked are checked
@@ -80,8 +91,10 @@ and the prompt hook ignores them, so they are not forwarded again.
   original `reply_to`; running workers are skipped. Defaults: 300s age, 600s
   between nudges, 2 nudges. Unknown presence is skipped unless explicitly
   allowed.
-- **Outbox cleanup.** Delivered/acked/failed records older than
-  `outboxTtlDays` (default 7) are removed; `msg` idempotency markers remain.
+- **Outbox cleanup.** Delivered/rejected/acked/failed records older than
+  `outboxTtlDays` (default 7) are removed together with their receipts;
+  sender-scoped `msg` idempotency markers remain. The background timer runs a
+  real cleanup; the tool defaults to a dry run.
 
 ## Pairing, spawning, and lifecycle
 
@@ -119,7 +132,7 @@ Plugin options are read from the plugin entry in `opencode.json(c)`:
 | `watchdogAfterSeconds` | 300 | Minimum age of an unacked task before a nudge |
 | `watchdogIntervalSeconds` | 600 | Minimum time between nudges for one task |
 | `watchdogMaxNudges` | 2 | Maximum nudges per task |
-| `outboxTtlDays` | 7 | Retention for delivered/acked/failed outbox records |
+| `outboxTtlDays` | 7 | Retention for delivered/rejected/acked/failed outbox records and receipts |
 
 ## Operational limits
 
@@ -156,4 +169,5 @@ Plugin options are read from the plugin entry in `opencode.json(c)`:
 
 `bun test` runs the Bun test suite under `test/`: multi-peer storage, async
 delivery, session lifecycle, footer identity, HMAC verification/task
-authorization, and headless server behaviour.
+authorization, inbound receipts and rejection reconciliation, retry/timer
+behaviour, and headless server behaviour.

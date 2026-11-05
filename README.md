@@ -216,22 +216,36 @@ its peers. It expires after 30 seconds; a headless or closed TUI shows
 
 ### Delivery reliability
 
-Every `postal_send` writes an outbox record before delivery:
+Every `postal_send` writes a sender-scoped outbox record before delivery:
 
-- successful delivery: `delivered`
-- failed delivery: retried after 1s, 2s, 4s, … up to 6 attempts
-- reply with `reply_to: <msg_id>`: marks the original letter `acked`
+- `pending`: queued or waiting for retry (`nextAt`); failed delivery is retried
+  after 1s, 2s, 4s, … up to 6 attempts
+- `delivered`: `session.prompt` accepted the letter; this is not proof that the
+  receiver processed it
+- `rejected`: the receiver verified the envelope but rejected it; `lastError`
+  carries `invalid_signature` or `unauthorized_task`
+- `acked`: the peer replied with `reply_to: <msg_id>`; admission alone does not
+  count as an ACK
+- `failed`: all retry attempts were exhausted
 
-Use `postal_inbox` to inspect the outbox and `postal_resend` to force a retry.
-This is a delivery queue, not the AI's pending inbox. When the rally limit is
-reached, pass `queueOnLimit: true` to retry after the window instead of
-rejecting the letter.
+The receiver writes a receipt under `receipt/<from>/<to>/<msg_id>` for every
+accepted letter and for authenticated rejections. `postal_inbox` reconciles
+receipts into the sender's outbox, so a rejected signature or unauthorized task
+is visible without waiting for a reply. Use `postal_inbox` to inspect the
+outbox, `postal_resend` to clear a rejection and retry, and `postal_retry` to
+scan due pending records. This is a delivery queue, not the AI's pending inbox.
+When the rally limit is reached, pass `queueOnLimit: true` to retry after the
+window instead of rejecting the letter.
 
 ### HMAC Phase 1
 
 Pairing creates a 32-byte HMAC-SHA256 key per pair (same location only). Every
-letter is signed over `keyID`, `issued_at`, and the rendered letter. The receiver
-verifies before the AI sees it:
+letter is signed over a v2 canonical payload containing `keyID`, `issued_at`,
+`from`, `to`, `msg_id`, `kind`, `task_id`, `reply_to`, and the rendered letter.
+The receiver rebuilds that payload from the metadata it is about to trust, so
+altering any of those fields fails verification. Legacy signatures are rejected
+with `unsupported_signature_version`. The receiver verifies before the AI sees
+it:
 
 - `issued_at` must be within `hmacWindowSeconds` (default 120; clamp 30–3600)
 - an invalid or missing signature clears the body and records
@@ -253,9 +267,10 @@ nudge that asks for a status or completion and references the original
 `nudgeUnknown` is passed. Defaults: 300s minimum age, 600s between nudges, max
 2 nudges per task. Use `dryRun` to inspect candidates.
 
-`postal_cleanup` removes delivered/acked/failed outbox records older than
-`outboxTtlDays` (default 7). It defaults to a dry run; pass `dryRun: false` to
-delete. `msg/<id>` idempotency markers are retained.
+`postal_cleanup` removes delivered/rejected/acked/failed outbox records older
+than `outboxTtlDays` (default 7) and their receipts. It defaults to a dry run;
+pass `dryRun: false` to delete. Sender-scoped `msg/<from>/<id>` idempotency
+markers are retained.
 
 ### Claims and lifecycle
 

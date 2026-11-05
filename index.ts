@@ -152,7 +152,7 @@ type ParentRecord = { parentID: string; createdAt: number }
 type HmacKey = { keyID: string; key: string; createdAt: number; validUntil?: number }
 type HmacRecord = { current: HmacKey; previous: HmacKey[] }
 
-type OutboxStatus = "pending" | "delivered" | "acked" | "failed"
+type OutboxStatus = "pending" | "delivered" | "acked" | "rejected" | "failed"
 type OutboxRecord = {
   msgID: string
   from: string
@@ -166,10 +166,23 @@ type OutboxRecord = {
   nextAt: number
   status: OutboxStatus
   lastError?: string
+  admittedAt?: number
   ackedAt?: number
   queuedForWindow?: boolean
   nudges?: number
   lastNudgeAt?: number
+}
+
+type ReceiptRecord = {
+  msgID: string
+  from: string
+  to: string
+  kind: string
+  taskID?: string
+  status: "accepted" | "rejected"
+  reason?: string
+  authorizedBy?: string
+  verifiedAt: number
 }
 
 const MENTION = /@(ses_[A-Za-z0-9_-]+)/g
@@ -655,15 +668,24 @@ function outboxTtlMs(ctx: PostalContext): number {
   return Math.max(1, Math.min(90, days)) * 24 * 60 * 60 * 1000
 }
 
-async function isAncestorOf(ctx: PostalContext, actor: string, target: string): Promise<boolean> {
+/** Return the ancestor that authorizes `actor` to task `target`, if any. */
+async function authorizingAncestor(
+  ctx: PostalContext,
+  actor: string,
+  target: string,
+): Promise<string | undefined> {
   let current = target
   for (let depth = 0; depth < 16; depth += 1) {
     const parent = await readParent(ctx, current)
-    if (!parent) return false
-    if (parent.parentID === actor) return true
+    if (!parent) return undefined
+    if (parent.parentID === actor) return actor
     current = parent.parentID
   }
-  return false
+  return undefined
+}
+
+async function isAncestorOf(ctx: PostalContext, actor: string, target: string): Promise<boolean> {
+  return Boolean(await authorizingAncestor(ctx, actor, target))
 }
 
 /** Deliver a letter immediately (no waiting); the peer replies with postal_send. */
@@ -912,7 +934,76 @@ async function updateOutbox(ctx: PostalContext, record: OutboxRecord): Promise<v
   }
 }
 
-async function listOutbox(ctx: PostalContext, from?: string): Promise<OutboxRecord[]> {
+const RECEIPT_INDEX = "receipt/index"
+
+function receiptKey(from: string, to: string, msgID: string): string {
+  return `receipt/${encodeURIComponent(from)}/${encodeURIComponent(to)}/${encodeURIComponent(msgID)}`
+}
+
+async function readReceiptIndex(ctx: PostalContext): Promise<string[]> {
+  const value = await ctx.storage.get(RECEIPT_INDEX)
+  return Array.isArray(value) ? value.filter((key): key is string => typeof key === "string") : []
+}
+
+async function writeReceiptIndex(ctx: PostalContext, keys: string[]): Promise<void> {
+  if (keys.length === 0) await ctx.storage.remove(RECEIPT_INDEX)
+  else await ctx.storage.set(RECEIPT_INDEX, keys)
+}
+
+async function readReceipt(
+  ctx: PostalContext,
+  from: string,
+  to: string,
+  msgID: string,
+): Promise<ReceiptRecord | undefined> {
+  const value = await ctx.storage.get(receiptKey(from, to, msgID))
+  return value && typeof value === "object" ? (value as ReceiptRecord) : undefined
+}
+
+async function putReceipt(ctx: PostalContext, receipt: ReceiptRecord): Promise<void> {
+  const key = receiptKey(receipt.from, receipt.to, receipt.msgID)
+  const existing = (await ctx.storage.get(key)) as ReceiptRecord | undefined
+  // Never overwrite an explicit acceptance with a rejection.
+  if (existing?.status === "accepted") return
+  await ctx.storage.set(key, receipt)
+  await serialized(outboxLocks, "receipt-index", async () => {
+    const index = await readReceiptIndex(ctx)
+    if (!index.includes(key)) {
+      index.push(key)
+      await writeReceiptIndex(ctx, index)
+    }
+  })
+}
+
+async function removeReceipt(ctx: PostalContext, from: string, to: string, msgID: string): Promise<void> {
+  const key = receiptKey(from, to, msgID)
+  await ctx.storage.remove(key)
+  await serialized(outboxLocks, "receipt-index", async () => {
+    const index = await readReceiptIndex(ctx)
+    const next = index.filter((entry) => entry !== key)
+    if (next.length !== index.length) await writeReceiptIndex(ctx, next)
+  })
+}
+
+/** Apply receiver receipts to delivered records (rejected + admitted time). */
+async function reconcileOutbox(ctx: PostalContext): Promise<void> {
+  const records = await listOutboxRaw(ctx)
+  for (const record of records) {
+    if (record.status !== "delivered") continue
+    const receipt = await readReceipt(ctx, record.from, record.to, record.msgID)
+    if (!receipt) continue
+    if (receipt.status === "rejected") {
+      record.status = "rejected"
+      record.lastError = receipt.reason ?? "rejected"
+      await updateOutbox(ctx, record)
+    } else if (record.admittedAt !== receipt.verifiedAt) {
+      record.admittedAt = receipt.verifiedAt
+      await updateOutbox(ctx, record)
+    }
+  }
+}
+
+async function listOutboxRaw(ctx: PostalContext, from?: string): Promise<OutboxRecord[]> {
   const keys = await readOutboxIndex(ctx)
   const records = await Promise.all(
     keys.map(async (key) => {
@@ -921,6 +1012,11 @@ async function listOutbox(ctx: PostalContext, from?: string): Promise<OutboxReco
     }),
   )
   return records.filter((record): record is OutboxRecord => Boolean(record) && (!from || record!.from === from))
+}
+
+async function listOutbox(ctx: PostalContext, from?: string): Promise<OutboxRecord[]> {
+  await reconcileOutbox(ctx)
+  return listOutboxRaw(ctx, from)
 }
 
 async function markOutboxAcked(
@@ -1157,15 +1253,22 @@ async function cleanupOutbox(
   const records = await listOutbox(ctx, options.from)
   const expired = records.filter(
     (record) =>
-      (record.status === "delivered" || record.status === "acked" || record.status === "failed") &&
+      (record.status === "delivered" ||
+        record.status === "acked" ||
+        record.status === "rejected" ||
+        record.status === "failed") &&
       now - record.createdAt > ttl,
   )
   if (options.dryRun || expired.length === 0) return expired
   const keys = new Set<string>()
+  const receiptKeys = new Set<string>()
   for (const record of expired) {
     const key = outboxKey(record.from, record.msgID)
     keys.add(key)
     await ctx.storage.remove(key)
+    const receipt = receiptKey(record.from, record.to, record.msgID)
+    receiptKeys.add(receipt)
+    await ctx.storage.remove(receipt)
     const legacyKey = `outbox/${record.msgID}`
     keys.add(legacyKey)
     const legacy = await ctx.storage.get(legacyKey)
@@ -1176,6 +1279,22 @@ async function cleanupOutbox(
   await serialized(outboxLocks, "index", async () => {
     const index = await readOutboxIndex(ctx)
     await writeOutboxIndex(ctx, index.filter((key) => !keys.has(key)))
+  })
+  await serialized(outboxLocks, "receipt-index", async () => {
+    const index = await readReceiptIndex(ctx)
+    const keep: string[] = []
+    for (const key of index) {
+      if (receiptKeys.has(key)) continue
+      if (options.from === undefined) {
+        const value = (await ctx.storage.get(key)) as ReceiptRecord | undefined
+        if (!value || now - value.verifiedAt > ttl) {
+          await ctx.storage.remove(key)
+          continue
+        }
+      }
+      keep.push(key)
+    }
+    await writeReceiptIndex(ctx, keep)
   })
   return expired
 }
@@ -1506,6 +1625,7 @@ async function setup(ctx: PostalContext): Promise<void> {
             `SESSION_PARENT\t${parent?.parentID ?? "-"}`,
             `SESSION_ORPHAN\t${parent ? "no" : "yes — no parent; no one can close this session"}`,
             `OUTBOX_PENDING\t${outbox.filter((record) => record.status === "pending").length}`,
+            `OUTBOX_REJECTED\t${outbox.filter((record) => record.status === "rejected").length}`,
             "PEER_ID\tTITLE\tRALLY_REMAINING\tLAST_LETTER\tRALLY_RESET_AT\tSTATE\tINBOX_COUNT\tPRESENCE_AT",
             ...rows,
           ].join("\n"),
@@ -1895,7 +2015,7 @@ async function setup(ctx: PostalContext): Promise<void> {
     editor.add({
       name: "inbox",
       description:
-        "List this session's outbox: pending, retrying, delivered, acked, or failed letters. " +
+        "List this session's outbox: pending, delivered, rejected, acked, or failed letters. " +
         "This is the delivery queue, not the AI inbox.",
       input: {
         type: "object",
@@ -1975,6 +2095,7 @@ async function setup(ctx: PostalContext): Promise<void> {
         if (record.from !== context.sessionID) {
           return { content: "postal: cannot resend another session's letter" }
         }
+        await removeReceipt(ctx, record.from, record.to, record.msgID)
         record.status = "pending"
         record.attempts = 0
         record.nextAt = 0
@@ -2327,36 +2448,72 @@ async function setup(ctx: PostalContext): Promise<void> {
       return
     }
     if (meta?.postal?.relay) {
+      const from = typeof meta.postal.from === "string" ? meta.postal.from : ""
+      const msgID = typeof meta.postal.msgID === "string" ? meta.postal.msgID : ""
+      const kind = typeof meta.postal.kind === "string" ? meta.postal.kind : "letter"
+      const taskID = typeof meta.postal.taskID === "string" ? meta.postal.taskID : undefined
+      const receiptBase =
+        from && msgID
+          ? { msgID, from, to: event.sessionID, kind, ...(taskID ? { taskID } : {}) }
+          : undefined
       const verification = await verifyLetter(
         ctx,
-        String(meta.postal.from ?? ""),
+        from,
         event.sessionID,
         event.prompt?.text ?? "",
         meta.postal,
       )
       if (!verification.ok) {
+        // A receipt is trustworthy only when the pair key matched the signature
+        // (invalid_signature means the keyID was valid but the payload was not).
+        if (verification.reason === "invalid_signature" && receiptBase) {
+          await putReceipt(ctx, {
+            ...receiptBase,
+            status: "rejected",
+            reason: verification.reason,
+            verifiedAt: Date.now(),
+          })
+        }
         event.prompt.text = ""
         meta.postal.reason = verification.reason
         return
       }
-      if (meta.postal.kind === "task") {
-        const from = meta.postal.from
-        if (!from || !(await isAncestorOf(ctx, from, event.sessionID))) {
+      let authorizedBy: string | undefined
+      if (kind === "task") {
+        authorizedBy = from ? await authorizingAncestor(ctx, from, event.sessionID) : undefined
+        if (!authorizedBy) {
+          if (receiptBase) {
+            await putReceipt(ctx, {
+              ...receiptBase,
+              status: "rejected",
+              reason: "unauthorized_task",
+              verifiedAt: Date.now(),
+            })
+          }
           event.prompt.text = ""
           meta.postal.reason = "unauthorized_task"
           return
         }
+        meta.postal.authorizedBy = authorizedBy
+      }
+      if (receiptBase) {
+        await putReceipt(ctx, {
+          ...receiptBase,
+          status: "accepted",
+          verifiedAt: Date.now(),
+          ...(authorizedBy ? { authorizedBy } : {}),
+        })
       }
       // ACK means "the peer replied to this letter", never "the envelope was admitted".
       // System nudges must not acknowledge the task they are watching.
       if (
-        meta.postal.kind !== "system" &&
+        kind !== "system" &&
         typeof meta.postal.replyTo === "string" &&
         meta.postal.replyTo.length > 0
       ) {
         void markOutboxAcked(ctx, meta.postal.replyTo, {
           sessionID: event.sessionID,
-          peerID: String(meta.postal.from ?? ""),
+          peerID: from,
         })
       }
       return

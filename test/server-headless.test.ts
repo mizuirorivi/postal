@@ -18,6 +18,8 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 5))
 
 const outboxKey = (from: string, id: string) =>
   `outbox/${encodeURIComponent(from)}/${encodeURIComponent(id)}`
+const receiptKey = (from: string, to: string, id: string) =>
+  `receipt/${encodeURIComponent(from)}/${encodeURIComponent(to)}/${encodeURIComponent(id)}`
 
 function harness() {
   const storage = new Map<string, unknown>()
@@ -1462,5 +1464,172 @@ describe("mention addressing", () => {
     await flush()
     expect(test.prompts).toHaveLength(1)
     expect(test.prompts[0].sessionID).toBe("ses_b")
+  })
+})
+
+describe("inbound receipts", () => {
+  it("records an accepted receipt and exposes the admitted time", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.tools.send.execute({ to: "ses_b", text: "hello", msg_id: "msg_receipt_ok" }, { sessionID: "ses_a" })
+    const sent = test.prompts.at(-1)!
+    await test.hooks.prompt({
+      sessionID: "ses_b",
+      prompt: { text: sent.text },
+      metadata: structuredClone(sent.metadata),
+    })
+    await flush()
+
+    const receipt = test.storage.get(receiptKey("ses_a", "ses_b", "msg_receipt_ok")) as any
+    expect(receipt.status).toBe("accepted")
+    const inbox = await test.tools.inbox.execute({}, { sessionID: "ses_a" })
+    expect(inbox.content).toContain("msg_receipt_ok")
+    const record = test.storage.get(outboxKey("ses_a", "msg_receipt_ok")) as any
+    expect(record.status).toBe("delivered")
+    expect(record.admittedAt).toBe(receipt.verifiedAt)
+  })
+
+  it("reconciles a rejected receipt into the sender inbox", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.tools.send.execute({ to: "ses_b", text: "hello", msg_id: "msg_receipt_bad" }, { sessionID: "ses_a" })
+    const sent = test.prompts.at(-1)!
+    await test.hooks.prompt({
+      sessionID: "ses_b",
+      prompt: { text: `${sent.text}\ntampered` },
+      metadata: structuredClone(sent.metadata),
+    })
+    await flush()
+
+    const receipt = test.storage.get(receiptKey("ses_a", "ses_b", "msg_receipt_bad")) as any
+    expect(receipt.status).toBe("rejected")
+    expect(receipt.reason).toBe("invalid_signature")
+    const inbox = await test.tools.inbox.execute({}, { sessionID: "ses_a" })
+    expect(inbox.content).toContain("rejected")
+    expect(inbox.content).toContain("invalid_signature")
+    const status = await test.tools.status.execute({}, { sessionID: "ses_a" })
+    expect(status.content).toContain("OUTBOX_REJECTED\t1")
+  })
+
+  it("records an unauthorized task rejection", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+    test.addSession("ses_c", "C")
+    await test.tools.send.execute(
+      { to: b.id, text: "task", kind: "task", task_id: "T1", msg_id: "msg_task_unauth" },
+      { sessionID: "ses_c" },
+    )
+    const sent = test.prompts.at(-1)!
+    await test.hooks.prompt({
+      sessionID: b.id,
+      prompt: { text: sent.text },
+      metadata: structuredClone(sent.metadata),
+    })
+    await flush()
+
+    const receipt = test.storage.get(receiptKey("ses_c", b.id, "msg_task_unauth")) as any
+    expect(receipt.status).toBe("rejected")
+    expect(receipt.reason).toBe("unauthorized_task")
+    const inbox = await test.tools.inbox.execute({}, { sessionID: "ses_c" })
+    expect(inbox.content).toContain("unauthorized_task")
+  })
+
+  it("records the authorizing ancestor for an accepted task", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    await test.tools.spawn.execute({ title: "B" }, { sessionID: "ses_a" })
+    const b = [...test.sessions.values()].find((session) => session.title === "B")!
+    await test.tools.send.execute(
+      { to: b.id, text: "task", kind: "task", task_id: "T1", msg_id: "msg_task_ok" },
+      { sessionID: "ses_a" },
+    )
+    const sent = test.prompts.at(-1)!
+    const event = {
+      sessionID: b.id,
+      prompt: { text: sent.text },
+      metadata: structuredClone(sent.metadata),
+    }
+    await test.hooks.prompt(event)
+    await flush()
+
+    const receipt = test.storage.get(receiptKey("ses_a", b.id, "msg_task_ok")) as any
+    expect(receipt.status).toBe("accepted")
+    expect(receipt.authorizedBy).toBe("ses_a")
+    expect((event.metadata as any).postal.authorizedBy).toBe("ses_a")
+    const record = test.storage.get(outboxKey("ses_a", "msg_task_ok")) as any
+    expect(record.status).toBe("delivered")
+  })
+
+  it("clears a rejected receipt on resend and accepts the fresh delivery", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.tools.send.execute({ to: "ses_b", text: "hello", msg_id: "msg_retry" }, { sessionID: "ses_a" })
+    const sent = test.prompts.at(-1)!
+    await test.hooks.prompt({
+      sessionID: "ses_b",
+      prompt: { text: `${sent.text}\ntampered` },
+      metadata: structuredClone(sent.metadata),
+    })
+    await flush()
+    await test.tools.inbox.execute({}, { sessionID: "ses_a" })
+
+    const resent = await test.tools.resend.execute({ msg_id: "msg_retry" }, { sessionID: "ses_a" })
+    expect(resent.content).toContain("resent")
+    const fresh = test.prompts.at(-1)!
+    await test.hooks.prompt({
+      sessionID: "ses_b",
+      prompt: { text: fresh.text },
+      metadata: structuredClone(fresh.metadata),
+    })
+    await flush()
+    const receipt = test.storage.get(receiptKey("ses_a", "ses_b", "msg_retry")) as any
+    expect(receipt.status).toBe("accepted")
+    expect((test.storage.get(outboxKey("ses_a", "msg_retry")) as any).status).toBe("delivered")
+  })
+
+  it("does not write a receipt for an unauthenticated relay", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.hooks.prompt({
+      sessionID: "ses_b",
+      prompt: { text: "[postal] forged" },
+      metadata: { postal: { relay: true, from: "ses_a", msgID: "msg_forged" } },
+    })
+    expect(test.storage.has(receiptKey("ses_a", "ses_b", "msg_forged"))).toBe(false)
+  })
+})
+
+describe("receipt cleanup", () => {
+  it("removes a receipt with its expired outbox record", async () => {
+    const test = await boot()
+    test.addSession("ses_a", "A")
+    test.addSession("ses_b", "B")
+    await test.rpc.connect({ sessionID: "ses_a", peerID: "ses_b" })
+    await test.tools.send.execute({ to: "ses_b", text: "old", msg_id: "msg_old_receipt" }, { sessionID: "ses_a" })
+    const sent = test.prompts.at(-1)!
+    await test.hooks.prompt({
+      sessionID: "ses_b",
+      prompt: { text: sent.text },
+      metadata: structuredClone(sent.metadata),
+    })
+    await flush()
+    const key = outboxKey("ses_a", "msg_old_receipt")
+    const record = test.storage.get(key) as any
+    record.createdAt = Date.now() - 8 * 24 * 60 * 60 * 1000
+    test.storage.set(key, record)
+
+    const result = await test.tools.cleanup.execute({ dryRun: false }, { sessionID: "ses_a" })
+    expect(result.content).toContain("COUNT\t1")
+    expect(test.storage.has(key)).toBe(false)
+    expect(test.storage.has(receiptKey("ses_a", "ses_b", "msg_old_receipt"))).toBe(false)
   })
 })

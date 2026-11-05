@@ -92,15 +92,24 @@ tasks; permissions remain the real boundary.
 
 ## Reliability and coordination
 
-- Every `postal_send` enters the outbox first. Failed deliveries are retried
-  with exponential backoff (6 attempts). `postal_inbox` lists the outbox;
-  `postal_resend` forces a retry.
-- A reply that includes `reply_to: <msg_id>` marks the original letter `acked`.
+- Every `postal_send` enters a sender-scoped outbox first. Failed deliveries are
+  retried with exponential backoff (6 attempts). `postal_inbox` lists the
+  outbox; `postal_resend` forces a retry; `postal_retry` scans due pending
+  records.
+- Outbox states: `pending`, `delivered` (the host accepted the prompt),
+  `rejected` (the receiver rejected the envelope; reason in `lastError`),
+  `acked` (the peer replied with `reply_to`), and `failed`.
+- Admission alone is not an ACK. A reply that includes `reply_to: <msg_id>`
+  marks the original letter `acked`; the watchdog keeps watching delivered
+  tasks until that reply arrives.
+- The receiver writes `receipt/<from>/<to>/<msg_id>` for accepted letters and
+  authenticated rejections, so `postal_inbox`/`postal_status` show rejection
+  without waiting for a reply.
 - `queueOnLimit: true` delays a letter until the rally window resets instead of
   rejecting it. This is a delayed send, not a queued prompt.
 - `postal_claim({ scope, ttl })` / `postal_release({ scope })` are advisory
-  locks for paths or task IDs. Re-claim to heartbeat. They do not enforce
-  filesystem permissions.
+  locks for paths or task IDs. Re-claim to heartbeat. They are serialized
+  within the plugin process but are not a cross-process or filesystem lock.
 - `postal_interrupt` interrupts a session; `postal_close` deletes another
   session and disconnects its peers. Both are restricted to the session that
   spawned the target (direct parent). `allowAncestorCommands: true` permits any
@@ -120,9 +129,10 @@ Tradeoffs:
   session or a peer; headless sessions show `unknown`. Presence is TUI-sourced
   and expires after 30 seconds. Pending metadata crosses the bridge, but message
   bodies do not.
-- HMAC signatures and a commander allowlist are not implemented. Any paired
-  peer can send a `task`; pair only trusted sessions and use permissions for
-  isolation.
+- HMAC Phase 1 signs every letter and binds envelope metadata. Tasks are
+  restricted to the target's parent/ancestor. A compromised peer with the pair
+  key can still sign a malicious task, so pair only trusted sessions and use
+  permissions for isolation. Keys are same-location only.
 
 ## Rally limit
 
