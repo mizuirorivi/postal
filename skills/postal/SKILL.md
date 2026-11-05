@@ -104,7 +104,8 @@ tasks; permissions remain the real boundary.
   tasks until that reply arrives.
 - The receiver writes `receipt/<from>/<to>/<msg_id>` for accepted letters and
   authenticated rejections, so `postal_inbox`/`postal_status` show rejection
-  without waiting for a reply.
+  without waiting for a reply. `postal_inbox` also shows `ADMITTED_AT` and
+  `AUTHORIZED_BY` after reconciliation.
 - `queueOnLimit: true` delays a letter until the rally window resets instead of
   rejecting it. This is a delayed send, not a queued prompt.
 - `postal_claim({ scope, ttl })` / `postal_release({ scope })` are advisory

@@ -167,6 +167,7 @@ type OutboxRecord = {
   status: OutboxStatus
   lastError?: string
   admittedAt?: number
+  authorizedBy?: string
   ackedAt?: number
   queuedForWindow?: boolean
   nudges?: number
@@ -996,8 +997,9 @@ async function reconcileOutbox(ctx: PostalContext): Promise<void> {
       record.status = "rejected"
       record.lastError = receipt.reason ?? "rejected"
       await updateOutbox(ctx, record)
-    } else if (record.admittedAt !== receipt.verifiedAt) {
+    } else if (record.admittedAt !== receipt.verifiedAt || record.authorizedBy !== receipt.authorizedBy) {
       record.admittedAt = receipt.verifiedAt
+      record.authorizedBy = receipt.authorizedBy
       await updateOutbox(ctx, record)
     }
   }
@@ -2039,6 +2041,7 @@ async function setup(ctx: PostalContext): Promise<void> {
           .slice(0, limit)
         const outboxRows = records.map((record) => {
           const nextAt = record.nextAt ? new Date(record.nextAt).toISOString() : "-"
+          const admittedAt = record.admittedAt ? new Date(record.admittedAt).toISOString() : "-"
           return [
             record.msgID,
             record.to,
@@ -2046,6 +2049,8 @@ async function setup(ctx: PostalContext): Promise<void> {
             record.attempts,
             nextAt,
             record.envelope.kind,
+            admittedAt,
+            record.authorizedBy ?? "-",
             record.lastError ?? "",
           ].join("\t")
         })
@@ -2063,7 +2068,7 @@ async function setup(ctx: PostalContext): Promise<void> {
         )
         const sections = [
           "--- outbox ---",
-          "MSG_ID\tTO\tSTATUS\tATTEMPTS\tNEXT_AT\tKIND\tLAST_ERROR",
+          "MSG_ID\tTO\tSTATUS\tATTEMPTS\tNEXT_AT\tKIND\tADMITTED_AT\tAUTHORIZED_BY\tLAST_ERROR",
           ...(outboxRows.length > 0 ? outboxRows : ["(empty)"]),
           "--- peer inbox ---",
           "PEER_ID\tTITLE\tSTATE\tINBOX_COUNT",

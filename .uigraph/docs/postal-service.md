@@ -139,10 +139,17 @@ Plugin options are read from the plugin entry in `opencode.json(c)`:
 - Outbox state lives in the per-location plugin KV table. It is not a global
   distributed queue; cross-project delivery still needs a reachable target.
 - ACK depends on the receiver passing `reply_to`; there is no runtime-level
-  acknowledgement. Watchdog only sees idle sessions through TUI presence;
+  acknowledgement. Admission writes a receipt, not an ACK, so the watchdog keeps
+  watching a delivered task until the reply arrives. Watchdog only sees idle
+  sessions through TUI presence;
   headless workers remain `unknown`. Nudges wake the worker and cost tokens.
-- Claims are advisory and can be ignored; filesystem permissions remain the real
-  enforcement boundary.
+- Claims are advisory, serialized within one plugin process, and can be ignored;
+  filesystem permissions remain the real enforcement boundary. Cross-process
+  coordination is out of scope in Phase 1.
+- `postal_inbox`, `postal_status`, and `postal_log` accept another session ID only
+  when the caller is that session or its parent/ancestor. `postal_watchdog` and
+  `postal_cleanup` operate on the caller's outbox; the background timer is the
+  only fleet-wide supervisor.
 - `postal_status` reports peers, rally budget, last letter, outbox count, and the
   session parent. It cannot see true busy/idle in the server plugin API; the TUI
   publishes presence separately.

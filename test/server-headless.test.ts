@@ -1564,6 +1564,9 @@ describe("inbound receipts", () => {
     expect((event.metadata as any).postal.authorizedBy).toBe("ses_a")
     const record = test.storage.get(outboxKey("ses_a", "msg_task_ok")) as any
     expect(record.status).toBe("delivered")
+    const inbox = await test.tools.inbox.execute({}, { sessionID: "ses_a" })
+    expect(inbox.content).toContain("ADMITTED_AT\tAUTHORIZED_BY")
+    expect(inbox.content).toMatch(/msg_task_ok.*task\t.*\tses_a/)
   })
 
   it("clears a rejected receipt on resend and accepts the fresh delivery", async () => {

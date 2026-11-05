@@ -231,7 +231,8 @@ Every `postal_send` writes a sender-scoped outbox record before delivery:
 The receiver writes a receipt under `receipt/<from>/<to>/<msg_id>` for every
 accepted letter and for authenticated rejections. `postal_inbox` reconciles
 receipts into the sender's outbox, so a rejected signature or unauthorized task
-is visible without waiting for a reply. Use `postal_inbox` to inspect the
+is visible without waiting for a reply. `postal_inbox` shows `ADMITTED_AT` and
+`AUTHORIZED_BY` once a receipt is reconciled. Use `postal_inbox` to inspect the
 outbox, `postal_resend` to clear a rejection and retry, and `postal_retry` to
 scan due pending records. This is a delivery queue, not the AI's pending inbox.
 When the rally limit is reached, pass `queueOnLimit: true` to retry after the
