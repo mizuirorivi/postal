@@ -4,6 +4,7 @@ import {
   handleFormCancelled,
   handleFormReplied,
 } from "../question-bridge.js"
+import { answerQuestion } from "../question-answer.js"
 import {
   questionKey,
   readQuestion,
@@ -13,6 +14,8 @@ import {
   type PostLetterInput,
 } from "../forms.js"
 import type { Lock } from "../grants.js"
+
+const flush = (ms = 50) => new Promise((resolve) => setTimeout(resolve, ms))
 
 function makeLock(): Lock {
   const tails = new Map<string, Promise<unknown>>()
@@ -158,7 +161,7 @@ describe("question forwarding", () => {
     expect(test.letters).toHaveLength(0)
   })
 
-  it("cancels the host form and keeps the record when delivery fails", async () => {
+  it("marks cancelling, then cancels the host form in the background", async () => {
     const test = harness()
     setParent(test, "ses_child", "ses_parent")
     const deps: FormsDeps = {
@@ -168,13 +171,14 @@ describe("question forwarding", () => {
       },
     }
     const result = await forwardQuestion(test.ctx, deps, form)
-    expect(result).toMatchObject({ status: "failed", cancelled: true })
+    expect(result).toMatchObject({ status: "failed" })
+    expect("cancelled" in result).toBe(false)
+    await flush()
     expect(test.cancels).toHaveLength(1)
     expect(test.cancels[0]).toMatchObject({ sessionID: "ses_child", formID: "form_1" })
-    expect(await readQuestion(test.ctx, "form_1")).toMatchObject({
-      status: "cancelled",
-      note: expect.stringContaining("delivery_failed"),
-    })
+    const record = await readQuestion(test.ctx, "form_1")
+    expect(record).toMatchObject({ status: "cancelled", note: expect.stringContaining("delivery_failed") })
+    expect(record?.cancelling).toBeUndefined()
   })
 
   it("cancels the host form over HTTP when only the HTTP cancel path is available", async () => {
@@ -208,7 +212,8 @@ describe("question forwarding", () => {
     }
     try {
       const result = await forwardQuestion(ctx, deps, form)
-      expect(result).toMatchObject({ status: "failed", cancelled: true })
+      expect(result).toMatchObject({ status: "failed" })
+      await flush()
       expect(deletes).toHaveLength(1)
       expect(deletes[0].method).toBe("DELETE")
       expect(deletes[0].path).toBe("/api/session/ses_child/form/form_1")
@@ -239,7 +244,8 @@ describe("question forwarding", () => {
     }
     try {
       const result = await forwardQuestion(ctx, deps, form)
-      expect(result).toMatchObject({ status: "failed", cancelled: false })
+      expect(result).toMatchObject({ status: "failed" })
+      await flush()
       const joined = warnings.join("\n")
       expect(joined).toContain("question delivery failed")
       expect(joined).toContain("host form not cancelled")
@@ -275,7 +281,8 @@ describe("question forwarding", () => {
     }
     try {
       const result = await forwardQuestion(ctx, deps, form)
-      expect(result).toMatchObject({ status: "failed", cancelled: false })
+      expect(result).toMatchObject({ status: "failed" })
+      await flush()
       const record = await readQuestion(ctx, "form_1")
       expect(record?.status).toBe("pending")
       expect(record?.note).toContain("cancel_failed")
@@ -319,6 +326,86 @@ describe("question forwarding", () => {
     } finally {
       console.warn = originalWarn
     }
+  })
+  it("warns for each ignored delivery reason", async () => {
+    const test = harness()
+    const warnings: string[] = []
+    const originalWarn = console.warn
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.join(" "))
+    }
+    try {
+      await forwardQuestion(test.ctx, test.deps, form)
+      setParent(test, "ses_child", "ses_parent")
+      await forwardQuestion(test.ctx, { ...test.deps, isPaired: async () => false }, form)
+      test.storage.set("grants/ses_child/ses_parent", {
+        from: "ses_child",
+        to: "ses_parent",
+        operations: { send: { allowed: false, approvalRequired: false } },
+        delivery: "interrupt",
+        initialized: true,
+        createdAt: 1,
+        updatedAt: 1,
+      })
+      await forwardQuestion(test.ctx, test.deps, { ...form, id: "form_2" })
+    } finally {
+      console.warn = originalWarn
+    }
+    const joined = warnings.join("\n")
+    expect(joined).toContain("no_parent")
+    expect(joined).toContain("not_paired")
+    expect(joined).toContain("send_not_granted")
+  })
+
+  it("sets cancelling without holding the lock during the host cancel", async () => {
+    const test = harness()
+    setParent(test, "ses_child", "ses_parent")
+    const held = new Set<string>()
+    const key = questionKey("form_1")
+    let heldDuringCancel: boolean | undefined
+    let sawCancelling: boolean | undefined
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const ctx: FormsContext = {
+      ...test.ctx,
+      session: {
+        form: {
+          cancel: async () => {
+            heldDuringCancel = held.has(key)
+            const stored = (await test.ctx.storage.get(key)) as Record<string, unknown>
+            sawCancelling = stored?.cancelling === true
+            await gate
+          },
+        },
+      },
+    }
+    const deps: FormsDeps = {
+      ...test.deps,
+      lock: async <T>(lockKey: string, task: () => Promise<T> | T): Promise<T> => {
+        held.add(lockKey)
+        try {
+          return await task()
+        } finally {
+          held.delete(lockKey)
+        }
+      },
+      postLetter: async () => {
+        throw new Error("delivery failed")
+      },
+    }
+    const result = await forwardQuestion(ctx, deps, form)
+    expect(result).toMatchObject({ status: "failed" })
+    // Cancel runs after the lock is released, and only once the marker is set.
+    expect(heldDuringCancel).toBe(false)
+    expect(sawCancelling).toBe(true)
+    expect(await readQuestion(ctx, "form_1")).toMatchObject({ status: "pending", cancelling: true })
+    release()
+    await flush()
+    const done = await readQuestion(ctx, "form_1")
+    expect(done?.status).toBe("cancelled")
+    expect(done?.cancelling).toBeUndefined()
   })
 })
 
@@ -370,4 +457,92 @@ describe("question resolution", () => {
     expect(test.letters).toHaveLength(2)
     expect(test.letters[1].body).toContain("cancelled")
   })
+  it("does not credit answeredBy from an in-flight settling marker", async () => {
+    const test = harness()
+    setParent(test, "ses_child", "ses_parent")
+    await forwardQuestion(test.ctx, test.deps, form)
+    const stored = test.storage.get(questionKey("form_1")) as Record<string, unknown>
+    test.storage.set(questionKey("form_1"), { ...stored, settlingBy: "ses_parent", settlingAt: Date.now() })
+    await handleFormReplied(test.ctx, test.deps, {
+      data: { id: "form_1", sessionID: "ses_child", answer: { q0: "postgres" } },
+    })
+    const record = await readQuestion(test.ctx, "form_1")
+    expect(record?.status).toBe("answered")
+    expect(record?.answeredBy).toBeUndefined()
+    expect(test.letters).toHaveLength(1)
+  })
+  it("leaves the record to the in-flight answer when a cancel races one", async () => {
+    const test = harness()
+    setParent(test, "ses_child", "ses_parent")
+    const key = questionKey("form_1")
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const ctx: FormsContext = {
+      ...test.ctx,
+      session: {
+        form: {
+          reply: test.ctx.session!.form!.reply,
+          cancel: async () => {
+            // Simulate an answer reserving while the host cancel is in flight.
+            const stored = (await test.ctx.storage.get(key)) as Record<string, unknown>
+            test.storage.set(key, { ...stored, settlingBy: "ses_parent", settlingAt: Date.now() })
+            await gate
+          },
+        },
+      },
+    }
+    const deps: FormsDeps = {
+      ...test.deps,
+      postLetter: async () => {
+        throw new Error("delivery failed")
+      },
+    }
+    await forwardQuestion(ctx, deps, form)
+    release()
+    await flush()
+    const raced = await readQuestion(ctx, "form_1")
+    expect(raced?.status).toBe("pending")
+    expect(raced?.note).toContain("cancel_raced")
+    expect(raced?.cancelling).toBeUndefined()
+    // Once the in-flight answer releases its marker, the record is answerable.
+    const stored = test.storage.get(key) as Record<string, unknown>
+    test.storage.set(key, { ...stored, settlingBy: undefined, settlingAt: undefined })
+    const answered = await answerQuestion(ctx, test.deps, {
+      actor: "ses_parent",
+      formID: "form_1",
+      answer: { q0: "postgres" },
+    })
+    expect(answered.ok).toBe(true)
+    expect((await readQuestion(ctx, "form_1"))?.status).toBe("answered")
+  })
+
+  it("records cancel_failed and clears cancelling when the final lock fails", async () => {
+    const test = harness()
+    setParent(test, "ses_child", "ses_parent")
+    const key = questionKey("form_1")
+    let keyLocks = 0
+    const deps: FormsDeps = {
+      ...test.deps,
+      lock: async <T>(lockKey: string, task: () => Promise<T> | T): Promise<T> => {
+        if (lockKey === key) {
+          keyLocks += 1
+          // 1 reservation, 2 marker, 3 finishCancellation try-lock -> throw.
+          if (keyLocks === 3) throw new Error("lock boom")
+        }
+        return await task()
+      },
+      postLetter: async () => {
+        throw new Error("delivery failed")
+      },
+    }
+    await forwardQuestion(test.ctx, deps, form)
+    await flush()
+    const record = await readQuestion(test.ctx, "form_1")
+    expect(record?.status).toBe("pending")
+    expect(record?.note).toContain("cancel_failed")
+    expect(record?.cancelling).toBeUndefined()
+  })
+
 })

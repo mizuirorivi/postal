@@ -1,8 +1,8 @@
 # Postal v2 — question/answer bridge
 
-- Status: implemented + hardening round 2 (qh-fix-1, uncommitted working tree)
+- Status: implemented + hardening rounds 3-5
 - Scope: form hook + `question`/`answer` envelopes + `postal_answer`
-- Baseline: `18995bd` plus the uncommitted question hardening
+- Baseline: `2b8eb7b` plus the round 3-5 hardening commit
 - Host: OpenCode 2.2.5
 
 ## 1. Goal
@@ -52,6 +52,8 @@ type QuestionRecord = {
   updatedAt: number
   settlingBy?: string  // postal_answer in flight
   settlingAt?: number  // stale-marker recovery (30s)
+  cancelling?: boolean    // background host cancel in flight
+  cancellingAt?: number   // stale-marker recovery (30s)
   answeredBy?: string
   answeredAt?: number
   cancelledAt?: number
@@ -77,29 +79,39 @@ external settlement.
 6. Deliver a `question` letter with `steer` (see §5), `form_id`, field keys,
    types, titles, and options. The letter's reply instruction names
    `postal_answer`, not `postal_send`. `kind` is part of the HMAC v2 payload.
-7. On delivery failure, cancel the host form so the blocked session is
-   unblocked: `ctx.session.form.cancel` when available, otherwise
-   `DELETE /api/session/{id}/form/{fid}?message=...`. If the cancel succeeds the
-   record becomes `cancelled` with `note = "delivery_failed: <line>"`; if the
-   cancel fails the record stays `pending` with
-   `note = "cancel_failed: <reason>"` and the failure is warned. `form.created`
-   fires once, so there is **no automatic retry** (see §6).
+7. On a delivery failure, mark `cancelling = true` + `cancellingAt` under the
+   `question/<formID>` lock (no host call while locked) and return immediately.
+   A background `finishCancellation` then cancels the host form —
+   `ctx.session.form.cancel` when available, otherwise
+   `DELETE /api/session/{id}/form/{fid}?message=...` (a failing runtime cancel
+   falls back to HTTP; HTTP retries network errors and 5xx up to 3 attempts with
+   150ms/300ms backoff and never retries 4xx). On completion it clears the
+   marker under the lock: a successful cancel makes the record `cancelled` with
+   `note = "delivery_failed: <line>"`, while a failed cancel keeps it `pending`
+   with `note = "cancel_failed: <reason>"` and warns. If an answer reserved
+   (`settlingBy`) while the cancel was in flight, the record stays `pending`
+   with `note = "cancel_raced: answer in flight"` and the in-flight answer
+   decides the final state. The failure text is returned to the caller as
+   `{ status: "failed", error }`. `form.created` fires once, so there is no
+   further retry (see §6).
 8. Ignore events whose `location.directory` is missing or does not match the
    bridge's location (missing is warned once).
-9. `no_parent`, `not_paired`, and `send_not_granted` are ignored: no letter, no
-   `question/<formID>` record, no cancel, and no warn. The child's form stays
-   open, so the child remains blocked until a human answers or cancels it
-   directly.
+9. `no_parent`, `not_paired`, and `send_not_granted` are ignored and warned
+   (formID + reason); no letter, no `question/<formID>` record, no cancel. The
+   child's form stays open, so the child remains blocked until a human answers
+   or cancels it directly.
 
 ### form.replied
 
 1. Ignore unknown forms, malformed IDs, or events whose `sessionID` is not the
    asker.
-2. Mark the record `answered` (`answeredBy = settlingBy`, if present).
-3. If the target answered through `postal_answer`, no notice is sent.
-4. Otherwise (human TUI answer, another ancestor, etc.) the asker sends a
-   `status` letter to the target: "answered; you do not need to answer it".
-   This prevents a stale answer to a question that is already settled.
+2. Mark the record `answered`. `answeredBy` is **not** credited here: it is set
+   only by `postal_answer` after the host confirms the reply. An in-flight
+   `settlingBy` suppresses the stand-down notice below instead.
+3. If no in-flight answer existed and the target did not itself answer, the
+   asker sends a `status` letter to the target: "answered; you do not need to
+   answer it". This prevents a stale answer to a question that is already
+   settled. An in-flight answer suppresses this notice.
 
 The asking session does not receive an `answer` letter: the host form tool
 returns the answer directly and unblocks the child.
@@ -121,9 +133,14 @@ Mark the record `cancelled` and send the same stand-down `status` letter.
    ≤64 KiB, no `__proto__`/`constructor`/`prototype`).
 4. Reserve `settlingBy = actor` + `settlingAt`, call the host form API, then mark
    `answered`. A non-stale `settlingBy` (including the same actor) is rejected;
-   a marker older than 30 seconds is treated as stale and recovered.
+   a marker older than 30 seconds is treated as stale and recovered. A non-stale
+   `cancelling` marker (background cancel in flight) is rejected with
+   `question is being cancelled`; a missing/older-than-30s marker is treated as
+   stale and cleared before proceeding.
 5. Failure handling keys on the HTTP status **and** the structured host error,
-   never on prose:
+   never on prose. A runtime `ctx.session.form.reply` error is classified the
+   same way (`_tag`/`name` → tag, `id`, and a status derived from the tag or
+   `cause.status`); an unclassifiable transport error stays `pending`.
    - `404` + `{ _tag: "FormNotFoundError", id: <formID> }` → mark `cancelled`
      with `note = "form_not_found"`.
    - `409` + `{ _tag: "FormAlreadySettledError", id: <formID> }` → mark
@@ -151,10 +168,11 @@ Set the plugin option `questionBridge: false` to disable the bridge entirely.
 
 `postal_answer`'s ancestor/task check is **cooperative**. The OpenCode 2.2.5
 form reply route is authenticated by the server password, not by the actor's
-session. Any same-user process that can read `service.json` can answer a form
-directly, bypassing Postal. Do not treat this check as a security boundary
-against a hostile local process. The HTTP fallback exists only because the
-plugin context does not expose an actor-scoped form API.
+session: any same-user process that can read `service.json` can answer a form
+directly, bypassing Postal. This is an upstream constraint (the host exposes no
+actor-scoped form API); Postal only adds a permission warning and loopback-only
+HTTP, and this check must not be treated as a security boundary against a
+hostile local process.
 
 - HTTP uses `node:http`/`node:https` directly, not `fetch`: Bun's `fetch`
   honors `HTTP_PROXY`/`HTTPS_PROXY` and would forward `Authorization` to the
@@ -163,8 +181,14 @@ plugin context does not expose an actor-scoped form API.
   deadline (default 5s, not socket inactivity), caps the read at 4 KiB without
   waiting for `end`, and guards resolve/reject so it settles exactly once.
   A synchronous `send` throw destroys the agent and rejects.
+- HTTPS accepts an optional CA (`FormsDeps.ca`), used only for `https:` hosts;
+  runtime form API errors are classified into tag/id/status so the same settle
+  rule applies on both paths.
 - HTTP and HTTPS endpoints are loopback-only (`127.0.0.1`, `localhost`, `::1`);
   URL credentials are rejected. No credential is logged, lettered, or committed.
+  The service registration's mode is checked (`statSync`) and group/other
+  readability is warned once; a same-user process can still read it, so treat the
+  local server password as shared.
 - Errors are sanitized and capped at 300 characters.
 - HMAC v2 covers `kind`, message id, `reply_to`, and the rendered letter; a
   tampered `question`/`answer` letter fails admission.
@@ -175,28 +199,35 @@ plugin context does not expose an actor-scoped form API.
 - Same-location only: the form service is in-memory and location-scoped. Events
   without a location, or from another location, are skipped.
 - Pending forms never expire. Settled forms expire after 10 minutes.
-- A question delivery is best-effort: it is not in the outbox and has no retry.
-  On failure Postal cancels the host form and marks the record `cancelled`; if
-  the cancel itself fails the record stays `pending` with `cancel_failed`, the
-  failure is surfaced via `console.warn`, and the child remains blocked until a
-  human answers or cancels the form. Reliable delivery remains a follow-up.
+- A question delivery is best-effort: it is not in the outbox. `formsDeps`
+  consumes the rally budget once and retries `postOnly` once after 150ms on a
+  non-rally failure **only when a stable `msgID` was supplied** (question
+  letters); `status` notices have no `msgID` and are never retried, so a notice
+  cannot be delivered twice. On a delivery failure the
+  record is marked `cancelling` and the host form is cancelled in the
+  background; success marks it `cancelled`, a failed cancel keeps it `pending`
+  with `cancel_failed`, the failure is surfaced via `console.warn`, and the child
+  remains blocked until a human answers or cancels the form. Reliable delivery
+  remains a follow-up.
 - Installing the plugin twice (global + project) runs two bridges. Keep one
   install per environment, as with the rest of Postal.
 
 ### Known limitations
 
-- The runtime `ctx.session.form.reply` path (unused on 2.2.5) does not classify
-  host errors, so a runtime failure leaves the record `pending`
-  (`form_state_unknown`). This is the safe side: only the HTTP path, with a
-  matching status + `_tag` + `id`, settles a record.
-- A cancel/answer race on the same form is rare and currently converges to
-  `ok: false` or `answered`: the host settles a form once and Postal serializes
-  per form, but `cancel` runs outside the question lock, so a concurrent settle
-  is caught by the §4 postal_answer step 5 re-check rather than prevented.
-- `handleFormReplied` still credits `answeredBy` from an in-flight
-  `settlingBy` when a reply arrives mid-answer, so the in-flight actor can remain
-  recorded in `answeredBy`; that is the pre-existing behavior and only affects
-  the stand-down notice.
+- The runtime `ctx.session.form.reply` path classifies `_tag`/`name`/`id`/status
+  (`FormNotFoundError` → 404, `FormAlreadySettledError` → 409) so the same
+  status + tag + id rule applies. An unclassifiable transport error (e.g.
+  `ClientError` without a tag/id) still leaves the record `pending`; that is the
+  safe side.
+- A cancel/answer race on the same form converges to `ok: false` or
+  `answered`: the host cancel runs in the background (not inside the question
+  lock), so an answer is rejected while `cancelling` is set (30s stale window)
+  and a settle that still races is caught by the §4 postal_answer step 5
+  re-check.
+- `handleFormReplied` no longer credits `answeredBy` from an in-flight
+  `settlingBy`; `answeredBy` is set only by `postal_answer` after the host
+  confirms. An in-flight settle suppresses the stand-down notice instead of
+  recording a false actor.
 
 ## 7. Files
 
@@ -207,7 +238,9 @@ plugin context does not expose an actor-scoped form API.
 - `index.ts` — envelope kinds, tool enums, tool registration, event bridge.
 - Tests: `test/forms.test.ts`, `test/questions.test.ts`,
   `test/question-answer.test.ts`, `test/question-integration.test.ts`,
-  `test/form-reply.test.ts`, `test/cancel-form.test.ts`.
+  `test/form-reply.test.ts`, `test/cancel-form.test.ts`,
+  `test/https-form-reply.test.ts`, `test/service-permissions.test.ts`
+  (fixtures: `test/fixtures/server-{cert,key}.pem`).
 
 ## 8. Follow-ups
 

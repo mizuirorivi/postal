@@ -288,4 +288,41 @@ describe("question envelope and bridge", () => {
     test.cleanup?.()
   })
 
+  it("retries a transient prompt failure once without double-counting rally", async () => {
+    const test = await boot()
+    let attempts = 0
+    test.context.session.prompt = async (input: Prompt) => {
+      attempts += 1
+      if (attempts === 1) throw new Error("transient prompt")
+      test.prompts.push(input)
+      return {}
+    }
+    test.events.push(questionEvent("form_retry", test.directory))
+    await flush(250)
+    expect(attempts).toBe(2)
+    expect(test.prompts).toHaveLength(1)
+    const rally = test.storage.get("rally/ses_child:ses_parent") as { count?: number } | undefined
+    expect(rally?.count).toBe(1)
+    expect(test.storage.get("question/form_retry")).toMatchObject({ status: "pending" })
+    test.cleanup?.()
+  })
+  it("does not retry a status notice that has no msgID", async () => {
+    const test = await boot()
+    test.events.push(questionEvent("form_notice", test.directory))
+    await flush(50)
+    expect(test.prompts).toHaveLength(1)
+    let attempts = 0
+    test.context.session.prompt = async () => {
+      attempts += 1
+      throw new Error("status notice failure")
+    }
+    test.events.push({
+      type: "form.cancelled",
+      location: { directory: test.directory },
+      data: { id: "form_notice", sessionID: "ses_child" },
+    })
+    await flush(300)
+    expect(attempts).toBe(1)
+    test.cleanup?.()
+  })
 })

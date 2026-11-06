@@ -1878,18 +1878,32 @@ function formsDeps(ctx: PostalContext): FormsDeps {
     isPaired: async (target, from, to) =>
       (await readPeers(target as unknown as PostalContext, from)).some((peer) => peer.id === to),
     postLetter: async (input) => {
+      // Consume the rally budget exactly once, even when the prompt is retried.
       const rally = await nextRally(ctx, input.from, input.to)
       const max = maxRally(ctx)
       if (rally > max) throw new Error(`rally limit reached (${max} letters)`)
-      const envelope = await postOnly(ctx, {
-        from: input.from,
-        to: input.to,
-        body: input.body,
-        rally,
-        max,
-        envelope: { kind: input.kind, msgID: input.msgID, replyTo: input.replyTo },
-        delivery: input.delivery,
-      })
+      const sendOnce = () =>
+        postOnly(ctx, {
+          from: input.from,
+          to: input.to,
+          body: input.body,
+          rally,
+          max,
+          envelope: { kind: input.kind, msgID: input.msgID, replyTo: input.replyTo },
+          delivery: input.delivery,
+        })
+      let envelope: Envelope
+      try {
+        envelope = await sendOnce()
+      } catch (error) {
+        // Only retry when the caller supplied a stable msgID (question letters).
+        // Status notices have no msgID and must not deliver twice.
+        if (!input.msgID) throw error
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 150)
+        })
+        envelope = await sendOnce()
+      }
       return { msgID: envelope.msgID }
     },
   }

@@ -317,4 +317,76 @@ describe("postal_answer", () => {
     expect(result).toMatchObject({ ok: false, error: expect.stringContaining("cancelled") })
   })
 
+  it("settles when the runtime reply throws a classified FormNotFoundError", async () => {
+    const test = harness()
+    test.ctx.session = {
+      form: {
+        reply: async () => {
+          throw Object.assign(new Error("Form not found: form_1"), {
+            _tag: "FormNotFoundError",
+            id: "form_1",
+          })
+        },
+      },
+    }
+    const result = await answerQuestion(test.ctx, test.deps, {
+      actor: "ses_parent",
+      formID: "form_1",
+      answer: { q0: "x" },
+    })
+    expect(result).toMatchObject({ ok: false, status: 404 })
+    const record = await readQuestion(test.ctx, "form_1")
+    expect(record?.status).toBe("cancelled")
+    expect(record?.note).toBe("form_not_found")
+  })
+
+  it("keeps the record pending on an unclassified runtime error", async () => {
+    const test = harness()
+    test.ctx.session = {
+      form: {
+        reply: async () => {
+          throw Object.assign(new Error("socket hang up"), { name: "ClientError" })
+        },
+      },
+    }
+    const result = await answerQuestion(test.ctx, test.deps, {
+      actor: "ses_parent",
+      formID: "form_1",
+      answer: { q0: "x" },
+    })
+    expect(result.ok).toBe(false)
+    const record = await readQuestion(test.ctx, "form_1")
+    expect(record?.status).toBe("pending")
+    expect(record?.note).toBe("form_state_unknown")
+  })
+
+  it("refuses to answer while a background cancel is in flight", async () => {
+    const test = harness()
+    const stored = test.storage.get(questionKey("form_1")) as Record<string, unknown>
+    test.storage.set(questionKey("form_1"), { ...stored, cancelling: true, cancellingAt: Date.now() })
+    expect(
+      await answerQuestion(test.ctx, test.deps, {
+        actor: "ses_parent",
+        formID: "form_1",
+        answer: { q0: "x" },
+      }),
+    ).toMatchObject({ ok: false, error: expect.stringContaining("being cancelled") })
+  })
+
+  it("recovers a stale cancelling marker", async () => {
+    const test = harness()
+    const stored = test.storage.get(questionKey("form_1")) as Record<string, unknown>
+    test.storage.set(questionKey("form_1"), {
+      ...stored,
+      cancelling: true,
+      cancellingAt: Date.now() - 60_000,
+    })
+    const result = await answerQuestion(test.ctx, test.deps, {
+      actor: "ses_parent",
+      formID: "form_1",
+      answer: { q0: "x" },
+    })
+    expect(result.ok).toBe(true)
+  })
+
 })

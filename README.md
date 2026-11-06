@@ -36,6 +36,7 @@ its own model, agent, permissions, and tab.
 - Append-only audit (`postal_audit`) for grant, revoke, delivery, task, and approval decisions
 - Per-relation delivery modes (`interrupt` / `idle` / `inbox`)
 - Task state separate from message ACK (`postal_task_state`), plus `request` vs `assignment` kinds
+- Question bridge: a child's question form is forwarded to the parent, answered with `postal_answer`; failed delivery cancels the form
 - `postal_tree` parent/child/ancestor view with spawn facts and grants
 - Advisory claims (`postal_claim` / `postal_release`)
 - Agent lifecycle (`postal_interrupt`, `postal_close`) with grant checks, and `postal_broadcast`
@@ -276,7 +277,6 @@ A spawn record is a fact (`spawn/<child>`); authority is a directed grant
   annotations. The TUI command is `Postal: Show session tree`.
 
 ### Approvals and audit
-
 An approval is bound to one operation payload: `operation`, `resource`, and
 sorted `parameters`, hashed with sha256. `postal_request_approval` creates a
 pending record (default 15 minutes, clamped to 1 minute–24 hours).

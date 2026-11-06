@@ -1,6 +1,6 @@
 {
   "name": "opencode-postal",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Session-to-session mail for OpenCode: @mentions, postal_send, multi-peer Ctrl+P pairing, RPC, rally limits.",
   "type": "module",
   "scripts": {

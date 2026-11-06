@@ -67,6 +67,14 @@ export async function answerQuestion(
     if (!current || current.status !== "pending") {
       return { error: `question already settled: ${formID}` }
     }
+    if (current.cancelling) {
+      // A background host cancel is in flight; refuse unless the marker is stale.
+      const staleCancelling =
+        typeof current.cancellingAt !== "number" || now - current.cancellingAt > STALE_SETTLING_MS
+      if (!staleCancelling) return { error: `question is being cancelled: ${formID}` }
+      delete current.cancelling
+      delete current.cancellingAt
+    }
     if (current.settlingBy) {
       // A marker without a timestamp cannot be trusted; treat it as stale so a
       // crashed answerer never blocks the question forever.

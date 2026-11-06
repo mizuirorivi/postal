@@ -30,7 +30,7 @@ export type ForwardResult =
   | { status: "forwarded"; record: QuestionRecord }
   | { status: "duplicate" }
   | { status: "ignored"; reason: string }
-  | { status: "failed"; error: string; cancelled: boolean }
+  | { status: "failed"; error: string }
 
 async function notifyTarget(
   ctx: FormsContext,
@@ -69,16 +69,22 @@ export async function forwardQuestion(
   if (!isValidFormID(form.id) || !isSessionID(form.sessionID)) {
     return { status: "ignored", reason: "invalid_form" }
   }
+  const ignore = (reason: string): ForwardResult => {
+    if (reason === "no_parent" || reason === "not_paired" || reason === "send_not_granted") {
+      console.warn(`postal: question ignored (${reason}) for ${form.id}`)
+    }
+    return { status: "ignored", reason }
+  }
   const target = await deps.readParent(ctx, form.sessionID)
   if (!isSessionID(target) || target === form.sessionID) {
-    return { status: "ignored", reason: "no_parent" }
+    return ignore("no_parent")
   }
   if (!(await deps.isPaired(ctx, form.sessionID, target))) {
-    return { status: "ignored", reason: "not_paired" }
+    return ignore("not_paired")
   }
   const grant = await ensureGrant(ctx, deps.lock, form.sessionID, target)
   if (!grant || !isRuleActive(grant.operations.send, "send")) {
-    return { status: "ignored", reason: "send_not_granted" }
+    return ignore("send_not_granted")
   }
 
   const key = questionKey(form.id)
@@ -101,47 +107,36 @@ export async function forwardQuestion(
   if ("existing" in reserved) return { status: "duplicate" }
   const record = reserved.record
 
-  let sent: { msgID: string }
+  const letter = {
+    from: record.asker,
+    to: record.target,
+    kind: "question" as const,
+    body: renderQuestionBody(form),
+    msgID: record.msgID,
+    delivery: "steer" as const,
+  }
+  let sent: { msgID: string } | undefined
+  let deliveryError: unknown
   try {
-    sent = await deps.postLetter({
-      from: record.asker,
-      to: record.target,
-      kind: "question",
-      body: renderQuestionBody(form),
-      msgID: record.msgID,
-      delivery: "steer",
-    })
+    sent = await deps.postLetter(letter)
   } catch (error) {
-    const message = oneLineText(errorText(error), 200)
-    // Delivery did not happen. Cancel the host form so the blocked session does
-    // not stay blocked, and keep the record as evidence instead of deleting it.
-    const cancelResult = await cancelForm(ctx, deps, {
-      sessionID: form.sessionID,
-      formID: form.id,
-      message: "Postal could not deliver this question to the parent, so it was cancelled.",
-    })
-    const cancelled = cancelResult.ok
+    deliveryError = error
+  }
+
+  if (!sent) {
+    const message = oneLineText(errorText(deliveryError), 200)
+    // Mark the record as cancelling under the lock, then run the host cancel in
+    // the background so a slow host never holds the question lock.
     await deps.lock(key, async () => {
       const current = await readQuestion(ctx, form.id)
       if (!current || current.status !== "pending") return
-      if (cancelled) {
-        current.status = "cancelled"
-        delete current.settlingBy
-        delete current.settlingAt
-        current.cancelledAt = Date.now()
-        current.note = `delivery_failed: ${message}`.slice(0, 200)
-      } else {
-        // The host form is still open; keep the record actionable.
-        current.note = `cancel_failed: ${oneLineText(cancelResult.error ?? "unknown", 200)}`.slice(0, 200)
-      }
+      current.cancelling = true
+      current.cancellingAt = Date.now()
       current.updatedAt = Date.now()
       await ctx.storage.set(key, current)
     })
-    console.warn(
-      `postal: question delivery failed for ${form.id}: ${message}` +
-        (cancelled ? "" : ` (host form not cancelled: ${cancelResult.error ?? "unknown"})`),
-    )
-    return { status: "failed", error: message, cancelled }
+    void finishCancellation(ctx, deps, form, message)
+    return { status: "failed", error: message }
   }
 
   // Delivery succeeded. Post-processing errors must never cancel the host form.
@@ -164,6 +159,72 @@ export async function forwardQuestion(
   return { status: "forwarded", record }
 }
 
+/**
+ * Background host-form cancel after a delivery failure. Never throws: all
+ * errors are caught and the cancelling marker is always cleared.
+ */
+async function finishCancellation(
+  ctx: FormsContext,
+  deps: FormsDeps,
+  form: FormInfo,
+  message: string,
+): Promise<void> {
+  const key = questionKey(form.id)
+  try {
+    const cancelResult = await cancelForm(ctx, deps, {
+      sessionID: form.sessionID,
+      formID: form.id,
+      message: "Postal could not deliver this question to the parent, so it was cancelled.",
+    })
+    const cancelled = cancelResult.ok
+    await deps.lock(key, async () => {
+      const current = await readQuestion(ctx, form.id)
+      if (!current) return
+      delete current.cancelling
+      delete current.cancellingAt
+      if (current.status === "pending") {
+        if (current.settlingBy) {
+          // An answer reserved while the cancel was in flight. Leave the record
+          // pending and let answerQuestion decide the final state.
+          current.note = "cancel_raced: answer in flight"
+        } else if (cancelled) {
+          current.status = "cancelled"
+          delete current.settlingBy
+          delete current.settlingAt
+          current.cancelledAt = Date.now()
+          current.note = `delivery_failed: ${message}`.slice(0, 200)
+        } else {
+          // The host form is still open; keep the record actionable.
+          current.note = `cancel_failed: ${oneLineText(cancelResult.error ?? "unknown", 200)}`.slice(0, 200)
+        }
+      }
+      current.updatedAt = Date.now()
+      await ctx.storage.set(key, current)
+    })
+    console.warn(
+      `postal: question delivery failed for ${form.id}: ${message}` +
+        (cancelled ? "" : ` (host form not cancelled: ${cancelResult.error ?? "unknown"})`),
+    )
+  } catch (error) {
+    console.warn(
+      `postal: question cancel failed for ${form.id}: ${oneLineText(errorText(error), 200)}`,
+    )
+    await deps
+      .lock(key, async () => {
+        const current = await readQuestion(ctx, form.id)
+        if (!current) return
+        if (current.status === "pending") {
+          current.note = `cancel_failed: ${oneLineText(errorText(error), 200)}`.slice(0, 200)
+        }
+        delete current.cancelling
+        delete current.cancellingAt
+        current.updatedAt = Date.now()
+        await ctx.storage.set(key, current)
+      })
+      .catch(() => {})
+  }
+}
+
 export async function handleFormReplied(
   ctx: FormsContext,
   deps: FormsDeps,
@@ -174,21 +235,29 @@ export async function handleFormReplied(
   const sessionID = typeof event.data?.sessionID === "string" ? event.data.sessionID : ""
   if (!isValidFormID(formID) || !isSessionID(sessionID)) return undefined
   const key = questionKey(formID)
+  let wasSettling = false
   const updated = await deps.lock(key, async () => {
     const record = await readQuestion(ctx, formID)
     if (!record || record.asker !== sessionID || record.status !== "pending") {
       return undefined
     }
+    wasSettling = Boolean(record.settlingBy)
+    delete record.cancelling
+    delete record.cancellingAt
     record.status = "answered"
-    if (record.settlingBy) record.answeredBy = record.settlingBy
+    // Never credit the actor here: `answeredBy` is set only by answerQuestion
+    // after the host confirms the reply.
     delete record.settlingBy
+    delete record.settlingAt
     record.answeredAt = now
     record.updatedAt = now
     await ctx.storage.set(key, record)
     return record
   })
   if (!updated) return undefined
-  if (updated.answeredBy !== updated.target) {
+  // An in-flight postal_answer will notify nothing; an external settle (human
+  // answer, another ancestor) sends the stand-down.
+  if (!wasSettling && updated.answeredBy !== updated.target) {
     const by = updated.answeredBy ? ` by ${updated.answeredBy}` : ""
     await notifyTarget(
       ctx,
@@ -217,6 +286,9 @@ export async function handleFormCancelled(
     }
     record.status = "cancelled"
     delete record.settlingBy
+    delete record.settlingAt
+    delete record.cancelling
+    delete record.cancellingAt
     record.cancelledAt = now
     record.updatedAt = now
     await ctx.storage.set(key, record)

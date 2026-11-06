@@ -9,7 +9,7 @@
  * Only routing metadata is stored (`question/<formID>`); answer bodies never
  * enter Postal storage. Forms are location-scoped and expire after 10 minutes.
  */
-import { readFileSync } from "node:fs"
+import { readFileSync, statSync } from "node:fs"
 import { Agent as HttpAgent, request as httpRequest } from "node:http"
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https"
 import { homedir } from "node:os"
@@ -56,6 +56,9 @@ export type QuestionRecord = {
   updatedAt: number
   settlingBy?: string
   settlingAt?: number
+  /** Set while a background host-form cancel is in flight. */
+  cancelling?: boolean
+  cancellingAt?: number
   answeredBy?: string
   answeredAt?: number
   cancelledAt?: number
@@ -99,6 +102,8 @@ export type FormsDeps = {
   isPaired: (ctx: FormsContext, from: string, to: string) => Promise<boolean>
   postLetter: (input: PostLetterInput) => Promise<{ msgID: string }>
   timeoutMs?: number
+  /** PEM CA bundle for HTTPS hosts (e.g. a self-signed test server). */
+  ca?: string
   env?: Record<string, string | undefined>
   home?: string
   readFile?: (path: string) => string
@@ -201,6 +206,8 @@ function normalizeQuestion(value: unknown, formID: string): QuestionRecord | und
       ? { settlingBy: record.settlingBy }
       : {}),
     ...(typeof record.settlingAt === "number" ? { settlingAt: record.settlingAt } : {}),
+    ...(record.cancelling === true ? { cancelling: true } : {}),
+    ...(typeof record.cancellingAt === "number" ? { cancellingAt: record.cancellingAt } : {}),
     ...(typeof record.answeredBy === "string" && record.answeredBy
       ? { answeredBy: record.answeredBy }
       : {}),
@@ -310,10 +317,16 @@ export async function replyToForm(
       )
       return { ok: true, via: "runtime" }
     } catch (error) {
+      // Classify the host error so the same status + _tag + id check applies on
+      // the runtime path; an unclassifiable transport error stays pending.
+      const host = classifyRuntimeError(error)
       return {
         ok: false,
         error: `form reply failed: ${oneLineText(errorText(error), 300)}`,
         via: "runtime",
+        ...(typeof host.status === "number" ? { status: host.status } : {}),
+        ...(host.tag ? { hostTag: host.tag } : {}),
+        ...(host.id ? { hostID: host.id } : {}),
       }
     }
   }
@@ -329,7 +342,7 @@ export async function replyToForm(
   const path = `/api/session/${encodeURIComponent(input.sessionID)}/form/${encodeURIComponent(input.formID)}/reply`
   const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS
   try {
-    const response = await postFormReply(endpoint, path, { answer: input.answer }, timeoutMs)
+    const response = await postFormReply(endpoint, path, { answer: input.answer }, timeoutMs, deps.ca)
     if (response.status === 204) return { ok: true, via: "http" }
     const host = parseHostError(response.text)
     return {
@@ -363,6 +376,42 @@ function parseHostError(text: string): { tag?: string; id?: string } {
 }
 
 /**
+ * Classify a runtime form API error. The OpenCode client throws `Error`
+ * instances with `_tag`/`id` assigned (and `name` set to the tag); transport
+ * failures are `ClientError`-like with a `cause.status`. A missing status is
+ * derived from the tag so `postal_answer` can settle on the runtime path too.
+ */
+function classifyRuntimeError(error: unknown): { tag?: string; id?: string; status?: number } {
+  if (!error || typeof error !== "object") return {}
+  const record = error as {
+    _tag?: unknown
+    name?: unknown
+    id?: unknown
+    status?: unknown
+    cause?: unknown
+  }
+  const tag =
+    typeof record._tag === "string" && record._tag
+      ? record._tag
+      : typeof record.name === "string" && record.name && record.name !== "Error"
+        ? record.name
+        : undefined
+  const id = typeof record.id === "string" && record.id ? record.id : undefined
+  let status = typeof record.status === "number" ? record.status : undefined
+  if (status === undefined && record.cause && typeof record.cause === "object") {
+    const causeStatus = (record.cause as { status?: unknown }).status
+    if (typeof causeStatus === "number") status = causeStatus
+  }
+  if (status === undefined && tag === "FormNotFoundError") status = 404
+  if (status === undefined && tag === "FormAlreadySettledError") status = 409
+  return {
+    ...(tag ? { tag } : {}),
+    ...(id ? { id } : {}),
+    ...(typeof status === "number" ? { status } : {}),
+  }
+}
+
+/**
  * Cancel a form the host owns. Runtime API first, loopback OpenAPI second.
  * Used when a question cannot be delivered, so the blocked session does not
  * stay blocked forever.
@@ -387,29 +436,62 @@ export async function cancelForm(
       )
       return { ok: true, via: "runtime" }
     } catch (error) {
-      return { ok: false, error: oneLineText(errorText(error), 300), via: "runtime" }
+      // The runtime cancel failed; fall back to HTTP before giving up.
+      const fallback = await cancelFormHttp(deps, input)
+      if (fallback.ok) return fallback
+      return {
+        ok: false,
+        error: `runtime cancel failed: ${oneLineText(errorText(error), 200)}; ${fallback.error ?? "http cancel failed"}`,
+        ...(fallback.via ? { via: fallback.via } : {}),
+      }
     }
   }
+  return cancelFormHttp(deps, input)
+}
 
+/**
+ * Cancel over loopback HTTP. Only network errors and 5xx are retried (max 3
+ * attempts, 150ms/300ms backoff); 4xx (including 404/409) is final.
+ */
+async function cancelFormHttp(
+  deps: FormsDeps,
+  input: { sessionID: string; formID: string; message?: string },
+): Promise<{ ok: boolean; error?: string; via?: "runtime" | "http" }> {
   const endpoint = discoverService(deps)
   if (!endpoint) return { ok: false, error: "form cancel API not available" }
   const query = input.message ? `?message=${encodeURIComponent(input.message)}` : ""
   const path = `/api/session/${encodeURIComponent(input.sessionID)}/form/${encodeURIComponent(input.formID)}${query}`
-  try {
-    const response = await formRequest(
-      endpoint,
-      { method: "DELETE", path },
-      deps.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    )
-    if (response.status === 204) return { ok: true, via: "http" }
-    return {
-      ok: false,
-      error: `form cancel failed (HTTP ${response.status})${response.text ? `: ${sanitizeError(response.text)}` : ""}`,
-      via: "http",
+  const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  let lastError = "form cancel failed"
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await formRequest(
+        endpoint,
+        { method: "DELETE", path, ...(deps.ca ? { ca: deps.ca } : {}) },
+        timeoutMs,
+      )
+      if (response.status === 204) return { ok: true, via: "http" }
+      const detail = response.text ? `: ${sanitizeError(response.text)}` : ""
+      if (response.status < 500) {
+        return {
+          ok: false,
+          error: `form cancel failed (HTTP ${response.status})${detail}`,
+          via: "http",
+        }
+      }
+      lastError = `form cancel failed (HTTP ${response.status})${detail}`
+    } catch (error) {
+      lastError = `form cancel request failed: ${oneLineText(errorText(error), 300)}`
     }
-  } catch (error) {
-    return { ok: false, error: `form cancel request failed: ${oneLineText(errorText(error), 300)}`, via: "http" }
+    if (attempt < 2) await cancelBackoff(attempt === 0 ? 150 : 300)
   }
+  return { ok: false, error: lastError, via: "http" }
+}
+
+function cancelBackoff(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
 }
 
 /**
@@ -427,15 +509,17 @@ export async function cancelForm(
  */
 function formRequest(
   endpoint: ServiceEndpoint,
-  options: { method: "POST" | "DELETE"; path: string; body?: unknown },
+  options: { method: "POST" | "DELETE"; path: string; body?: unknown; ca?: string },
   timeoutMs: number,
 ): Promise<{ status: number; text: string }> {
   return new Promise((resolve, reject) => {
     const url = new URL(options.path, endpoint.url)
     const isHttps = url.protocol === "https:"
+    // Serialize before allocating the agent so a circular/BigInt body rejects
+    // the promise without leaking an agent.
+    const payload = options.body === undefined ? undefined : JSON.stringify(options.body)
     const send = isHttps ? httpsRequest : httpRequest
     const agent = isHttps ? new HttpsAgent({ keepAlive: false }) : new HttpAgent({ keepAlive: false })
-    const payload = options.body === undefined ? undefined : JSON.stringify(options.body)
     const headers: Record<string, string> = {
       authorization: `Basic ${Buffer.from(
         `${endpoint.username}:${endpoint.password}`,
@@ -469,25 +553,34 @@ function formRequest(
     }
 
     try {
-      request = send(url, { method: options.method, agent, headers }, (response) => {
-        const chunks: Buffer[] = []
-        let size = 0
-        response.on("data", (chunk: Buffer) => {
-          if (settled) return
-          const remaining = MAX_RESPONSE_BYTES - size
-          if (remaining > 0) {
-            const part = chunk.subarray(0, remaining)
-            chunks.push(part)
-            size += part.length
-          }
-          if (size >= MAX_RESPONSE_BYTES) {
-            // Stop at the cap; a large or slow body must not hang the caller.
-            finish(response.statusCode ?? 0, Buffer.concat(chunks).toString("utf8"))
-          }
-        })
-        response.on("end", () => finish(response.statusCode ?? 0, Buffer.concat(chunks).toString("utf8")))
-        response.on("error", fail)
-      })
+      request = send(
+        url,
+        {
+          method: options.method,
+          agent,
+          headers,
+          ...(isHttps && options.ca ? { ca: options.ca } : {}),
+        },
+        (response) => {
+          const chunks: Buffer[] = []
+          let size = 0
+          response.on("data", (chunk: Buffer) => {
+            if (settled) return
+            const remaining = MAX_RESPONSE_BYTES - size
+            if (remaining > 0) {
+              const part = chunk.subarray(0, remaining)
+              chunks.push(part)
+              size += part.length
+            }
+            if (size >= MAX_RESPONSE_BYTES) {
+              // Stop at the cap; a large or slow body must not hang the caller.
+              finish(response.statusCode ?? 0, Buffer.concat(chunks).toString("utf8"))
+            }
+          })
+          response.on("end", () => finish(response.statusCode ?? 0, Buffer.concat(chunks).toString("utf8")))
+          response.on("error", fail)
+        },
+      )
     } catch (error) {
       // `send` can throw synchronously (e.g. invalid URL/headers); the timer is
       // not set yet, so only the agent needs tearing down.
@@ -500,7 +593,12 @@ function formRequest(
     timer = setTimeout(() => fail(new Error(`form request timed out after ${timeoutMs}ms`)), timeoutMs)
     timer.unref?.()
     request.on("error", fail)
-    request.end(payload)
+    try {
+      request.end(payload)
+    } catch (error) {
+      // A synchronous `end` throw must still clear the timer and tear down.
+      fail(error instanceof Error ? error : new Error(String(error)))
+    }
   })
 }
 
@@ -509,8 +607,9 @@ function postFormReply(
   path: string,
   body: unknown,
   timeoutMs: number,
+  ca?: string,
 ): Promise<{ status: number; text: string }> {
-  return formRequest(endpoint, { method: "POST", path, body }, timeoutMs)
+  return formRequest(endpoint, { method: "POST", path, body, ...(ca ? { ca } : {}) }, timeoutMs)
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
@@ -564,6 +663,7 @@ export function discoverService(
     join(home, ".config", "opencode", "service.json"),
   ]) {
     try {
+      warnIfRegistrationExposed(path)
       const parsed = JSON.parse(read(path)) as { url?: unknown; password?: unknown }
       if (
         typeof parsed.url !== "string" ||
@@ -579,6 +679,21 @@ export function discoverService(
     }
   }
   return undefined
+}
+
+/** Warn once per registration file when group/other bits can read the password. */
+const warnedRegistrationPermissions = new Set<string>()
+function warnIfRegistrationExposed(path: string): void {
+  if (warnedRegistrationPermissions.has(path)) return
+  let mode: number
+  try {
+    mode = statSync(path).mode
+  } catch {
+    return
+  }
+  if ((mode & 0o077) === 0) return
+  warnedRegistrationPermissions.add(path)
+  console.warn(`postal: service registration is group/world readable: ${path}`)
 }
 
 function safeServiceURL(value: string): string | undefined {
