@@ -68,8 +68,10 @@ export async function answerQuestion(
       return { error: `question already settled: ${formID}` }
     }
     if (current.settlingBy) {
+      // A marker without a timestamp cannot be trusted; treat it as stale so a
+      // crashed answerer never blocks the question forever.
       const stale =
-        typeof current.settlingAt === "number" && now - current.settlingAt > STALE_SETTLING_MS
+        typeof current.settlingAt !== "number" || now - current.settlingAt > STALE_SETTLING_MS
       if (!stale) return { error: `question is being answered by ${current.settlingBy}` }
     }
     current.settlingBy = input.actor
@@ -92,11 +94,21 @@ export async function answerQuestion(
       delete current.settlingBy
       delete current.settlingAt
       current.updatedAt = Date.now()
-      if (reply.status === 404 && /form not found/i.test(reply.error)) {
+      // Confirm from the structured host error, not the status code or prose:
+      // a different service or a spoofed message must not settle the record.
+      // Require the HTTP status too, so a 200/500 body that merely carries a
+      // tag/id cannot settle it.
+      const hostNotFound =
+        reply.status === 404 && reply.hostTag === "FormNotFoundError" && reply.hostID === formID
+      const hostSettled =
+        reply.status === 409 &&
+        reply.hostTag === "FormAlreadySettledError" &&
+        reply.hostID === formID
+      if (hostNotFound) {
         current.status = "cancelled"
         current.cancelledAt = Date.now()
         current.note = "form_not_found"
-      } else if (reply.status === 409) {
+      } else if (hostSettled) {
         // The host rejected this answer; do not credit the actor.
         current.status = "answered"
         current.note = "form_already_settled"
@@ -114,7 +126,7 @@ export async function answerQuestion(
 
   const final = await deps.lock(key, async () => {
     const current = await readQuestion(ctx, formID)
-    if (!current) return undefined
+    if (!current) return { kind: "missing" as const }
     if (current.status === "pending") {
       current.status = "answered"
       current.answeredBy = input.actor
@@ -123,12 +135,24 @@ export async function answerQuestion(
       delete current.settlingBy
       delete current.settlingAt
       await ctx.storage.set(key, current)
-    } else if (current.status === "answered" && !current.answeredBy) {
-      current.answeredBy = input.actor
-      current.updatedAt = Date.now()
-      await ctx.storage.set(key, current)
+      return { kind: "answered" as const, record: current }
     }
-    return current
+    if (current.status === "answered") {
+      if (!current.answeredBy) {
+        current.answeredBy = input.actor
+        current.updatedAt = Date.now()
+        await ctx.storage.set(key, current)
+      }
+      return { kind: "answered" as const, record: current }
+    }
+    // Cancelled (or any other terminal state) must not be reported as success.
+    return { kind: "cancelled" as const, record: current }
   })
-  return { ok: true, record: final ?? record }
+  if (final.kind === "cancelled") {
+    return { ok: false, error: `question was cancelled: ${formID}` }
+  }
+  if (final.kind === "missing") {
+    return { ok: false, error: `question record disappeared: ${formID}` }
+  }
+  return { ok: true, record: final.record }
 }

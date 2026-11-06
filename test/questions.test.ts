@@ -29,6 +29,7 @@ function harness() {
   const parents = new Map<string, string>()
   const letters: PostLetterInput[] = []
   const replies: Array<{ sessionID: string; formID: string; answer: unknown }> = []
+  const cancels: Array<{ sessionID: string; formID: string; message?: string }> = []
   const ctx: FormsContext = {
     storage: {
       get: async (key: string) => storage.get(key),
@@ -44,6 +45,9 @@ function harness() {
       form: {
         reply: async (input) => {
           replies.push(input)
+        },
+        cancel: async (input) => {
+          cancels.push(input)
         },
       },
     },
@@ -72,7 +76,7 @@ function harness() {
       throw new Error("missing")
     },
   }
-  return { ctx, deps, storage, parents, letters, replies }
+  return { ctx, deps, storage, parents, letters, replies, cancels }
 }
 
 function setParent(test: ReturnType<typeof harness>, child: string, parent: string): void {
@@ -154,7 +158,7 @@ describe("question forwarding", () => {
     expect(test.letters).toHaveLength(0)
   })
 
-  it("removes the record when delivery fails so a retry can forward", async () => {
+  it("cancels the host form and keeps the record when delivery fails", async () => {
     const test = harness()
     setParent(test, "ses_child", "ses_parent")
     const deps: FormsDeps = {
@@ -163,8 +167,158 @@ describe("question forwarding", () => {
         throw new Error("delivery failed")
       },
     }
-    expect(await forwardQuestion(test.ctx, deps, form)).toMatchObject({ status: "failed" })
-    expect(await readQuestion(test.ctx, "form_1")).toBeUndefined()
+    const result = await forwardQuestion(test.ctx, deps, form)
+    expect(result).toMatchObject({ status: "failed", cancelled: true })
+    expect(test.cancels).toHaveLength(1)
+    expect(test.cancels[0]).toMatchObject({ sessionID: "ses_child", formID: "form_1" })
+    expect(await readQuestion(test.ctx, "form_1")).toMatchObject({
+      status: "cancelled",
+      note: expect.stringContaining("delivery_failed"),
+    })
+  })
+
+  it("cancels the host form over HTTP when only the HTTP cancel path is available", async () => {
+    const test = harness()
+    setParent(test, "ses_child", "ses_parent")
+    const ctx: FormsContext = { ...test.ctx, session: { form: {} } }
+    const deletes: Array<{ method: string; path: string; query: string }> = []
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (request) => {
+        const url = new URL(request.url)
+        if (request.method === "DELETE") {
+          deletes.push({
+            method: request.method,
+            path: url.pathname,
+            query: url.searchParams.get("message") ?? "",
+          })
+        }
+        return new Response(null, { status: 204 })
+      },
+    })
+    const deps: FormsDeps = {
+      ...test.deps,
+      env: {
+        OPENCODE_SERVER_URL: `http://127.0.0.1:${server.port}`,
+        OPENCODE_SERVER_PASSWORD: "pw",
+      },
+      postLetter: async () => {
+        throw new Error("delivery failed")
+      },
+    }
+    try {
+      const result = await forwardQuestion(ctx, deps, form)
+      expect(result).toMatchObject({ status: "failed", cancelled: true })
+      expect(deletes).toHaveLength(1)
+      expect(deletes[0].method).toBe("DELETE")
+      expect(deletes[0].path).toBe("/api/session/ses_child/form/form_1")
+      expect(deletes[0].query.length).toBeGreaterThan(0)
+      expect(await readQuestion(ctx, "form_1")).toMatchObject({
+        status: "cancelled",
+        note: expect.stringContaining("delivery_failed"),
+      })
+    } finally {
+      server.stop(true)
+    }
+  })
+
+  it("reports failed, warns, and keeps the record pending when no cancel means exists", async () => {
+    const test = harness()
+    setParent(test, "ses_child", "ses_parent")
+    const ctx: FormsContext = { ...test.ctx, session: { form: {} } }
+    const deps: FormsDeps = {
+      ...test.deps,
+      postLetter: async () => {
+        throw new Error("no transport")
+      },
+    }
+    const warnings: string[] = []
+    const originalWarn = console.warn
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.join(" "))
+    }
+    try {
+      const result = await forwardQuestion(ctx, deps, form)
+      expect(result).toMatchObject({ status: "failed", cancelled: false })
+      const joined = warnings.join("\n")
+      expect(joined).toContain("question delivery failed")
+      expect(joined).toContain("host form not cancelled")
+    } finally {
+      console.warn = originalWarn
+    }
+    const record = await readQuestion(ctx, "form_1")
+    expect(record?.status).toBe("pending")
+    expect(record?.note).toContain("cancel_failed")
+  })
+
+  it("keeps the record pending when the host cancel returns 404", async () => {
+    const test = harness()
+    setParent(test, "ses_child", "ses_parent")
+    const ctx: FormsContext = { ...test.ctx, session: { form: {} } }
+    const server = Bun.serve({
+      port: 0,
+      fetch: async () =>
+        new Response(
+          JSON.stringify({ _tag: "FormNotFoundError", id: "form_1", message: "Form not found: form_1" }),
+          { status: 404, headers: { "content-type": "application/json" } },
+        ),
+    })
+    const deps: FormsDeps = {
+      ...test.deps,
+      env: {
+        OPENCODE_SERVER_URL: `http://127.0.0.1:${server.port}`,
+        OPENCODE_SERVER_PASSWORD: "pw",
+      },
+      postLetter: async () => {
+        throw new Error("boom")
+      },
+    }
+    try {
+      const result = await forwardQuestion(ctx, deps, form)
+      expect(result).toMatchObject({ status: "failed", cancelled: false })
+      const record = await readQuestion(ctx, "form_1")
+      expect(record?.status).toBe("pending")
+      expect(record?.note).toContain("cancel_failed")
+    } finally {
+      server.stop(true)
+    }
+  })
+
+  it("keeps the delivery when only the post-delivery bookkeeping fails", async () => {
+    const test = harness()
+    setParent(test, "ses_child", "ses_parent")
+    let failNext = false
+    const ctx: FormsContext = {
+      ...test.ctx,
+      storage: {
+        get: test.ctx.storage.get,
+        remove: test.ctx.storage.remove,
+        set: async (key, value) => {
+          if (failNext) throw new Error("storage exploded")
+          await test.ctx.storage.set(key, value)
+        },
+      },
+    }
+    const deps: FormsDeps = {
+      ...test.deps,
+      postLetter: async () => {
+        failNext = true
+        return { msgID: "msg_new" }
+      },
+    }
+    const warnings: string[] = []
+    const originalWarn = console.warn
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.join(" "))
+    }
+    try {
+      const result = await forwardQuestion(ctx, deps, form)
+      expect(result).toMatchObject({ status: "forwarded" })
+      expect(test.cancels).toHaveLength(0)
+      expect(warnings.join("\n")).toContain("msgID update failed")
+    } finally {
+      console.warn = originalWarn
+    }
   })
 })
 

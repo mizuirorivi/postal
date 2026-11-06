@@ -10,6 +10,7 @@
  */
 import { ensureGrant, isRuleActive } from "./grants.js"
 import {
+  cancelForm,
   errorText,
   isQuestionForm,
   isSessionID,
@@ -29,7 +30,7 @@ export type ForwardResult =
   | { status: "forwarded"; record: QuestionRecord }
   | { status: "duplicate" }
   | { status: "ignored"; reason: string }
-  | { status: "failed"; error: string }
+  | { status: "failed"; error: string; cancelled: boolean }
 
 async function notifyTarget(
   ctx: FormsContext,
@@ -100,8 +101,9 @@ export async function forwardQuestion(
   if ("existing" in reserved) return { status: "duplicate" }
   const record = reserved.record
 
+  let sent: { msgID: string }
   try {
-    const sent = await deps.postLetter({
+    sent = await deps.postLetter({
       from: record.asker,
       to: record.target,
       kind: "question",
@@ -109,7 +111,42 @@ export async function forwardQuestion(
       msgID: record.msgID,
       delivery: "steer",
     })
-    if (sent.msgID && sent.msgID !== record.msgID) {
+  } catch (error) {
+    const message = oneLineText(errorText(error), 200)
+    // Delivery did not happen. Cancel the host form so the blocked session does
+    // not stay blocked, and keep the record as evidence instead of deleting it.
+    const cancelResult = await cancelForm(ctx, deps, {
+      sessionID: form.sessionID,
+      formID: form.id,
+      message: "Postal could not deliver this question to the parent, so it was cancelled.",
+    })
+    const cancelled = cancelResult.ok
+    await deps.lock(key, async () => {
+      const current = await readQuestion(ctx, form.id)
+      if (!current || current.status !== "pending") return
+      if (cancelled) {
+        current.status = "cancelled"
+        delete current.settlingBy
+        delete current.settlingAt
+        current.cancelledAt = Date.now()
+        current.note = `delivery_failed: ${message}`.slice(0, 200)
+      } else {
+        // The host form is still open; keep the record actionable.
+        current.note = `cancel_failed: ${oneLineText(cancelResult.error ?? "unknown", 200)}`.slice(0, 200)
+      }
+      current.updatedAt = Date.now()
+      await ctx.storage.set(key, current)
+    })
+    console.warn(
+      `postal: question delivery failed for ${form.id}: ${message}` +
+        (cancelled ? "" : ` (host form not cancelled: ${cancelResult.error ?? "unknown"})`),
+    )
+    return { status: "failed", error: message, cancelled }
+  }
+
+  // Delivery succeeded. Post-processing errors must never cancel the host form.
+  if (sent.msgID && sent.msgID !== record.msgID) {
+    try {
       await deps.lock(key, async () => {
         const current = await readQuestion(ctx, form.id)
         if (!current || current.status !== "pending") return
@@ -118,17 +155,13 @@ export async function forwardQuestion(
         await ctx.storage.set(key, current)
       })
       record.msgID = sent.msgID
+    } catch (error) {
+      console.warn(
+        `postal: question msgID update failed for ${form.id}: ${oneLineText(errorText(error), 200)}`,
+      )
     }
-    return { status: "forwarded", record }
-  } catch (error) {
-    await deps.lock(key, async () => {
-      const current = await readQuestion(ctx, form.id)
-      if (current?.status === "pending" && current.msgID === record.msgID) {
-        await ctx.storage.remove(key)
-      }
-    })
-    return { status: "failed", error: errorText(error) }
   }
+  return { status: "forwarded", record }
 }
 
 export async function handleFormReplied(

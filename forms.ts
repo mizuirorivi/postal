@@ -10,8 +10,8 @@
  * enter Postal storage. Forms are location-scoped and expire after 10 minutes.
  */
 import { readFileSync } from "node:fs"
-import { request as httpRequest } from "node:http"
-import { request as httpsRequest } from "node:https"
+import { Agent as HttpAgent, request as httpRequest } from "node:http"
+import { Agent as HttpsAgent, request as httpsRequest } from "node:https"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import type { Lock } from "./grants.js"
@@ -76,6 +76,7 @@ export type FormsContext = {
         formID: string
         answer: FormAnswer
       }) => Promise<unknown>
+      cancel?: (input: { sessionID: string; formID: string; message?: string }) => Promise<unknown>
     }
   }
   options?: Record<string, unknown>
@@ -105,7 +106,16 @@ export type FormsDeps = {
 
 export type ReplyResult =
   | { ok: true; via: "runtime" | "http" }
-  | { ok: false; error: string; status?: number; via?: "runtime" | "http" }
+  | {
+      ok: false
+      error: string
+      status?: number
+      via?: "runtime" | "http"
+      /** Host error tag (e.g. `FormNotFoundError`) when the body is structured. */
+      hostTag?: string
+      /** Host error `id`, used to confirm the error refers to this form. */
+      hostID?: string
+    }
 
 export type ServiceEndpoint = {
   url: string
@@ -321,11 +331,14 @@ export async function replyToForm(
   try {
     const response = await postFormReply(endpoint, path, { answer: input.answer }, timeoutMs)
     if (response.status === 204) return { ok: true, via: "http" }
+    const host = parseHostError(response.text)
     return {
       ok: false,
       status: response.status,
       error: `form reply failed (HTTP ${response.status})${response.text ? `: ${sanitizeError(response.text)}` : ""}`,
       via: "http",
+      ...(host.tag ? { hostTag: host.tag } : {}),
+      ...(host.id ? { hostID: host.id } : {}),
     }
   } catch (error) {
     return {
@@ -336,61 +349,168 @@ export async function replyToForm(
   }
 }
 
+/** Parse a structured host error body (`{ _tag, id, message }`) when present. */
+function parseHostError(text: string): { tag?: string; id?: string } {
+  try {
+    const parsed = JSON.parse(text) as { _tag?: unknown; id?: unknown }
+    return {
+      ...(typeof parsed._tag === "string" ? { tag: parsed._tag } : {}),
+      ...(typeof parsed.id === "string" ? { id: parsed.id } : {}),
+    }
+  } catch {
+    return {}
+  }
+}
+
 /**
- * POST directly with node:http/https.
+ * Cancel a form the host owns. Runtime API first, loopback OpenAPI second.
+ * Used when a question cannot be delivered, so the blocked session does not
+ * stay blocked forever.
+ */
+export async function cancelForm(
+  ctx: FormsContext,
+  deps: FormsDeps,
+  input: { sessionID: string; formID: string; message?: string },
+): Promise<{ ok: boolean; error?: string; via?: "runtime" | "http" }> {
+  const runtime = ctx.session?.form
+  if (runtime && typeof runtime.cancel === "function") {
+    try {
+      await withTimeout(
+        Promise.resolve(
+          runtime.cancel({
+            sessionID: input.sessionID,
+            formID: input.formID,
+            ...(input.message ? { message: input.message } : {}),
+          }),
+        ),
+        deps.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      )
+      return { ok: true, via: "runtime" }
+    } catch (error) {
+      return { ok: false, error: oneLineText(errorText(error), 300), via: "runtime" }
+    }
+  }
+
+  const endpoint = discoverService(deps)
+  if (!endpoint) return { ok: false, error: "form cancel API not available" }
+  const query = input.message ? `?message=${encodeURIComponent(input.message)}` : ""
+  const path = `/api/session/${encodeURIComponent(input.sessionID)}/form/${encodeURIComponent(input.formID)}${query}`
+  try {
+    const response = await formRequest(
+      endpoint,
+      { method: "DELETE", path },
+      deps.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    )
+    if (response.status === 204) return { ok: true, via: "http" }
+    return {
+      ok: false,
+      error: `form cancel failed (HTTP ${response.status})${response.text ? `: ${sanitizeError(response.text)}` : ""}`,
+      via: "http",
+    }
+  } catch (error) {
+    return { ok: false, error: `form cancel request failed: ${oneLineText(errorText(error), 300)}`, via: "http" }
+  }
+}
+
+/**
+ * Send a form request directly with node:http/https.
  *
  * Bun's `fetch` honors HTTP_PROXY/HTTPS_PROXY and forwards Authorization
  * headers through the proxy, which would leak the local server password.
  * node:http ignores proxy environment variables, does not follow redirects,
- * and lets us cap the response body and the request lifetime.
+ * and lets us cap the response body and the total request lifetime.
+ *
+ * A dedicated, non-keepalive agent is used per request (never the shared
+ * `globalAgent`). A total-time timer destroys the request, the body read stops
+ * at `MAX_RESPONSE_BYTES` instead of waiting for `end`, and a `settled` guard
+ * makes resolve/reject exactly once.
  */
+function formRequest(
+  endpoint: ServiceEndpoint,
+  options: { method: "POST" | "DELETE"; path: string; body?: unknown },
+  timeoutMs: number,
+): Promise<{ status: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(options.path, endpoint.url)
+    const isHttps = url.protocol === "https:"
+    const send = isHttps ? httpsRequest : httpRequest
+    const agent = isHttps ? new HttpsAgent({ keepAlive: false }) : new HttpAgent({ keepAlive: false })
+    const payload = options.body === undefined ? undefined : JSON.stringify(options.body)
+    const headers: Record<string, string> = {
+      authorization: `Basic ${Buffer.from(
+        `${endpoint.username}:${endpoint.password}`,
+      ).toString("base64")}`,
+    }
+    if (payload !== undefined) {
+      headers["content-type"] = "application/json"
+      headers["content-length"] = String(Buffer.byteLength(payload))
+    }
+
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let request: ReturnType<typeof httpRequest>
+    const teardown = (): void => {
+      request.destroy()
+      agent.destroy()
+    }
+    const finish = (status: number, text: string): void => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      teardown()
+      resolve({ status, text })
+    }
+    const fail = (error: Error): void => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      teardown()
+      reject(error)
+    }
+
+    try {
+      request = send(url, { method: options.method, agent, headers }, (response) => {
+        const chunks: Buffer[] = []
+        let size = 0
+        response.on("data", (chunk: Buffer) => {
+          if (settled) return
+          const remaining = MAX_RESPONSE_BYTES - size
+          if (remaining > 0) {
+            const part = chunk.subarray(0, remaining)
+            chunks.push(part)
+            size += part.length
+          }
+          if (size >= MAX_RESPONSE_BYTES) {
+            // Stop at the cap; a large or slow body must not hang the caller.
+            finish(response.statusCode ?? 0, Buffer.concat(chunks).toString("utf8"))
+          }
+        })
+        response.on("end", () => finish(response.statusCode ?? 0, Buffer.concat(chunks).toString("utf8")))
+        response.on("error", fail)
+      })
+    } catch (error) {
+      // `send` can throw synchronously (e.g. invalid URL/headers); the timer is
+      // not set yet, so only the agent needs tearing down.
+      settled = true
+      agent.destroy()
+      reject(error instanceof Error ? error : new Error(String(error)))
+      return
+    }
+    // Overall deadline, not just socket inactivity.
+    timer = setTimeout(() => fail(new Error(`form request timed out after ${timeoutMs}ms`)), timeoutMs)
+    timer.unref?.()
+    request.on("error", fail)
+    request.end(payload)
+  })
+}
+
 function postFormReply(
   endpoint: ServiceEndpoint,
   path: string,
   body: unknown,
   timeoutMs: number,
 ): Promise<{ status: number; text: string }> {
-  return new Promise((resolve, reject) => {
-    const url = new URL(path, endpoint.url)
-    const send = url.protocol === "https:" ? httpsRequest : httpRequest
-    const payload = JSON.stringify(body)
-    const request = send(
-      url,
-      {
-        method: "POST",
-        headers: {
-          authorization: `Basic ${Buffer.from(
-            `${endpoint.username}:${endpoint.password}`,
-          ).toString("base64")}`,
-          "content-type": "application/json",
-          "content-length": Buffer.byteLength(payload),
-        },
-        timeout: timeoutMs,
-      },
-      (response) => {
-        const chunks: Buffer[] = []
-        let size = 0
-        response.on("data", (chunk: Buffer) => {
-          if (size >= MAX_RESPONSE_BYTES) return
-          const part = chunk.subarray(0, MAX_RESPONSE_BYTES - size)
-          chunks.push(part)
-          size += part.length
-        })
-        response.on("end", () => {
-          resolve({
-            status: response.statusCode ?? 0,
-            text: Buffer.concat(chunks).toString("utf8"),
-          })
-        })
-        response.on("error", reject)
-      },
-    )
-    request.on("timeout", () => {
-      request.destroy(new Error(`form reply timed out after ${timeoutMs}ms`))
-    })
-    request.on("error", reject)
-    request.end(payload)
-  })
+  return formRequest(endpoint, { method: "POST", path, body }, timeoutMs)
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {

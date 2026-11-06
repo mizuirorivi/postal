@@ -1916,13 +1916,23 @@ function startFormBridge(ctx: PostalContext): () => void {
     types: ["form.created", "form.replied", "form.cancelled"],
   })[Symbol.asyncIterator]()
   const location = ctx.location?.directory
+  let warnedMissingLocation = false
   void (async () => {
     try {
       for (;;) {
         const next = await iterator.next()
         if (next.done || controller.signal.aborted) break
         const event = next.value
-        if (event.location?.directory && location && event.location.directory !== location) continue
+        // Fail closed: process only events whose location matches this bridge.
+        const eventDir = event.location?.directory
+        if (!eventDir) {
+          if (!warnedMissingLocation) {
+            warnedMissingLocation = true
+            console.warn("postal: form bridge event without a location; skipping (warned once)")
+          }
+          continue
+        }
+        if (!location || eventDir !== location) continue
         try {
           if (event.type === "form.created") {
             await forwardQuestion(ctx as FormsContext, deps, event.data?.form)

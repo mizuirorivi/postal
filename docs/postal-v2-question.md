@@ -1,8 +1,8 @@
 # Postal v2 — question/answer bridge
 
-- Status: implemented + security hardening (pending human review)
+- Status: implemented + hardening round 2 (qh-fix-1, uncommitted working tree)
 - Scope: form hook + `question`/`answer` envelopes + `postal_answer`
-- Baseline: `c243617` plus the hardening commit
+- Baseline: `18995bd` plus the uncommitted question hardening
 - Host: OpenCode 2.2.5
 
 ## 1. Goal
@@ -18,7 +18,12 @@ the form is answered or cancelled elsewhere.
   `metadata = { kind: "question", tool: { messageID, id } }` and fields
   `q0..qN` (`packages/core/src/tool/plugin/question.ts`).
 - Form events: `form.created { form }`, `form.replied { id, sessionID, answer }`,
-  `form.cancelled { id, sessionID }`.
+  `form.cancelled { id, sessionID }`, each carrying `location.directory`
+  (live-verified: a `form.created` stream item included
+  `"location":{"directory":"/home/rivi/postal"}`).
+- The bridge processes an event only when both the event and the bridge expose a
+  matching `location.directory`; a missing location is skipped and warned once
+  (fail-closed).
 - Plugin context exposes `ctx.event.subscribe({ types })`.
 - `@opencode/plugin@2.2.5` does **not** expose `session.form`; the plugin
   context's `SessionDomain` omits it. `postal_answer` prefers a runtime
@@ -72,9 +77,19 @@ external settlement.
 6. Deliver a `question` letter with `steer` (see §5), `form_id`, field keys,
    types, titles, and options. The letter's reply instruction names
    `postal_answer`, not `postal_send`. `kind` is part of the HMAC v2 payload.
-7. On delivery failure, remove the reservation. `form.created` fires once, so
-   there is **no automatic retry** (see §6).
-8. Ignore events whose `location.directory` is not the bridge's location.
+7. On delivery failure, cancel the host form so the blocked session is
+   unblocked: `ctx.session.form.cancel` when available, otherwise
+   `DELETE /api/session/{id}/form/{fid}?message=...`. If the cancel succeeds the
+   record becomes `cancelled` with `note = "delivery_failed: <line>"`; if the
+   cancel fails the record stays `pending` with
+   `note = "cancel_failed: <reason>"` and the failure is warned. `form.created`
+   fires once, so there is **no automatic retry** (see §6).
+8. Ignore events whose `location.directory` is missing or does not match the
+   bridge's location (missing is warned once).
+9. `no_parent`, `not_paired`, and `send_not_granted` are ignored: no letter, no
+   `question/<formID>` record, no cancel, and no warn. The child's form stays
+   open, so the child remains blocked until a human answers or cancels it
+   directly.
 
 ### form.replied
 
@@ -107,15 +122,19 @@ Mark the record `cancelled` and send the same stand-down `status` letter.
 4. Reserve `settlingBy = actor` + `settlingAt`, call the host form API, then mark
    `answered`. A non-stale `settlingBy` (including the same actor) is rejected;
    a marker older than 30 seconds is treated as stale and recovered.
-5. Failure handling:
-   - Host 404 with a confirmed `Form not found: <id>` → mark `cancelled` with
-     `note = "form_not_found"`.
-   - Ambiguous 404 (wrong server/port/registration) → leave `pending` with
-     `note = "form_state_unknown"` and return the error.
-   - Host 409 → mark `answered` with `note = "form_already_settled"` but do
-     **not** credit the caller (`answeredBy` stays unset).
+5. Failure handling keys on the HTTP status **and** the structured host error,
+   never on prose:
+   - `404` + `{ _tag: "FormNotFoundError", id: <formID> }` → mark `cancelled`
+     with `note = "form_not_found"`.
+   - `409` + `{ _tag: "FormAlreadySettledError", id: <formID> }` → mark
+     `answered` with `note = "form_already_settled"` but do **not** credit the
+     caller (`answeredBy` stays unset).
+   - Any other 404/409, or a tag/id on a `200`/`500` body, leaves the record
+     `pending` with `note = "form_state_unknown"`.
    - Other failures clear `settlingBy`/`settlingAt` and leave the record
      `pending`.
+   - If the record is no longer `pending` when the reply returns (e.g. cancelled
+     concurrently), the call reports `ok: false` instead of success.
 6. The host validates the actual field keys/types/options; Postal does not
    duplicate that schema.
 
@@ -139,8 +158,11 @@ plugin context does not expose an actor-scoped form API.
 
 - HTTP uses `node:http`/`node:https` directly, not `fetch`: Bun's `fetch`
   honors `HTTP_PROXY`/`HTTPS_PROXY` and would forward `Authorization` to the
-  proxy. The direct client ignores proxy env, does not follow redirects, has a
-  5s timeout, and caps error bodies at 4 KiB.
+  proxy. The direct client ignores proxy env, does not follow redirects, uses a
+  dedicated non-keepalive `Agent` (never `globalAgent`), enforces a total-time
+  deadline (default 5s, not socket inactivity), caps the read at 4 KiB without
+  waiting for `end`, and guards resolve/reject so it settles exactly once.
+  A synchronous `send` throw destroys the agent and rejects.
 - HTTP and HTTPS endpoints are loopback-only (`127.0.0.1`, `localhost`, `::1`);
   URL credentials are rejected. No credential is logged, lettered, or committed.
 - Errors are sanitized and capped at 300 characters.
@@ -150,14 +172,31 @@ plugin context does not expose an actor-scoped form API.
   `question`/`answer` use `send`, never `task`.
 - Only `asker → current parent` is forwarded, and only when the parent is a
   paired peer; parent → child questions are out of scope.
-- Same-location only: the form service is in-memory and location-scoped; events
-  from another location are ignored.
+- Same-location only: the form service is in-memory and location-scoped. Events
+  without a location, or from another location, are skipped.
 - Pending forms never expire. Settled forms expire after 10 minutes.
 - A question delivery is best-effort: it is not in the outbox and has no retry.
-  A failed delivery removes the record and leaves the child blocked until a
-  human answers its form directly. Reliable question delivery is a follow-up.
+  On failure Postal cancels the host form and marks the record `cancelled`; if
+  the cancel itself fails the record stays `pending` with `cancel_failed`, the
+  failure is surfaced via `console.warn`, and the child remains blocked until a
+  human answers or cancels the form. Reliable delivery remains a follow-up.
 - Installing the plugin twice (global + project) runs two bridges. Keep one
   install per environment, as with the rest of Postal.
+
+### Known limitations
+
+- The runtime `ctx.session.form.reply` path (unused on 2.2.5) does not classify
+  host errors, so a runtime failure leaves the record `pending`
+  (`form_state_unknown`). This is the safe side: only the HTTP path, with a
+  matching status + `_tag` + `id`, settles a record.
+- A cancel/answer race on the same form is rare and currently converges to
+  `ok: false` or `answered`: the host settles a form once and Postal serializes
+  per form, but `cancel` runs outside the question lock, so a concurrent settle
+  is caught by the §4 postal_answer step 5 re-check rather than prevented.
+- `handleFormReplied` still credits `answeredBy` from an in-flight
+  `settlingBy` when a reply arrives mid-answer, so the in-flight actor can remain
+  recorded in `answeredBy`; that is the pre-existing behavior and only affects
+  the stand-down notice.
 
 ## 7. Files
 
@@ -168,7 +207,7 @@ plugin context does not expose an actor-scoped form API.
 - `index.ts` — envelope kinds, tool enums, tool registration, event bridge.
 - Tests: `test/forms.test.ts`, `test/questions.test.ts`,
   `test/question-answer.test.ts`, `test/question-integration.test.ts`,
-  `test/form-reply.test.ts`.
+  `test/form-reply.test.ts`, `test/cancel-form.test.ts`.
 
 ## 8. Follow-ups
 

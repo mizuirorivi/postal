@@ -201,78 +201,120 @@ describe("postal_answer", () => {
     expect(result.ok).toBe(true)
     expect(test.replies).toHaveLength(1)
   })
-  it("only cancels on a confirmed form-not-found and never credits a rejected answer", async () => {
+  it("settles only from the structured host error with a matching id", async () => {
     const test = harness()
     test.ctx.session = undefined
-    let message = "Not Found"
+    let body: Record<string, unknown> = { message: "Not Found" }
     let status = 404
     const server = Bun.serve({
       port: 0,
       fetch: async () =>
-        new Response(JSON.stringify({ message }), {
-          status,
-          headers: { "content-type": "application/json" },
-        }),
+        new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } }),
     })
     test.deps.env = {
       OPENCODE_SERVER_URL: `http://127.0.0.1:${server.port}`,
       OPENCODE_SERVER_PASSWORD: "pw",
     }
     try {
-      expect(
-        await answerQuestion(test.ctx, test.deps, {
-          actor: "ses_parent",
-          formID: "form_1",
-          answer: { q0: "x" },
-        }),
-      ).toMatchObject({ ok: false, status: 404 })
+      // Prose-only 404 must not settle.
+      await answerQuestion(test.ctx, test.deps, { actor: "ses_parent", formID: "form_1", answer: { q0: "x" } })
       let record = await readQuestion(test.ctx, "form_1")
       expect(record?.status).toBe("pending")
       expect(record?.note).toBe("form_state_unknown")
 
-      message = "Form not found: form_1"
+      // A 404 that names a different form must not settle.
+      body = { _tag: "FormNotFoundError", id: "form_other", message: "Form not found: form_other" }
+      await answerQuestion(test.ctx, test.deps, { actor: "ses_parent", formID: "form_1", answer: { q0: "x" } })
+      record = await readQuestion(test.ctx, "form_1")
+      expect(record?.status).toBe("pending")
+
+      // A 409 for a different form must not settle.
+      status = 409
+      body = { _tag: "FormAlreadySettledError", id: "form_other", message: "Form already settled: form_other" }
+      await answerQuestion(test.ctx, test.deps, { actor: "ses_parent", formID: "form_1", answer: { q0: "x" } })
+      record = await readQuestion(test.ctx, "form_1")
+      expect(record?.status).toBe("pending")
+
+      // A 200 body carrying the tag/id must not settle.
+      status = 200
+      body = { _tag: "FormNotFoundError", id: "form_1", message: "Form not found: form_1" }
+      await answerQuestion(test.ctx, test.deps, { actor: "ses_parent", formID: "form_1", answer: { q0: "x" } })
+      record = await readQuestion(test.ctx, "form_1")
+      expect(record?.status).toBe("pending")
+
+      // Confirmed 404 settles as cancelled.
+      status = 404
+      body = { _tag: "FormNotFoundError", id: "form_1", message: "Form not found: form_1" }
       expect(
-        await answerQuestion(test.ctx, test.deps, {
-          actor: "ses_parent",
-          formID: "form_1",
-          answer: { q0: "x" },
-        }),
+        await answerQuestion(test.ctx, test.deps, { actor: "ses_parent", formID: "form_1", answer: { q0: "x" } }),
       ).toMatchObject({ ok: false, status: 404 })
       record = await readQuestion(test.ctx, "form_1")
       expect(record?.status).toBe("cancelled")
       expect(record?.note).toBe("form_not_found")
-
-      const second = harness()
-      second.ctx.session = undefined
-      const conflict = Bun.serve({
-        port: 0,
-        fetch: async () =>
-          new Response(JSON.stringify({ message: "Form already settled: form_1" }), {
-            status: 409,
-            headers: { "content-type": "application/json" },
-          }),
-      })
-      second.deps.env = {
-        OPENCODE_SERVER_URL: `http://127.0.0.1:${conflict.port}`,
-        OPENCODE_SERVER_PASSWORD: "pw",
-      }
-      try {
-        expect(
-          await answerQuestion(second.ctx, second.deps, {
-            actor: "ses_parent",
-            formID: "form_1",
-            answer: { q0: "x" },
-          }),
-        ).toMatchObject({ ok: false, status: 409 })
-        const settled = await readQuestion(second.ctx, "form_1")
-        expect(settled).toMatchObject({ status: "answered", note: "form_already_settled" })
-        expect(settled?.answeredBy).toBeUndefined()
-      } finally {
-        conflict.stop(true)
-      }
     } finally {
       server.stop(true)
     }
+
+    // Confirmed 409 settles as answered, without crediting the actor.
+    const second = harness()
+    second.ctx.session = undefined
+    const conflict = Bun.serve({
+      port: 0,
+      fetch: async () =>
+        new Response(JSON.stringify({ _tag: "FormAlreadySettledError", id: "form_1", message: "Form already settled" }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        }),
+    })
+    second.deps.env = {
+      OPENCODE_SERVER_URL: `http://127.0.0.1:${conflict.port}`,
+      OPENCODE_SERVER_PASSWORD: "pw",
+    }
+    try {
+      expect(
+        await answerQuestion(second.ctx, second.deps, {
+          actor: "ses_parent",
+          formID: "form_1",
+          answer: { q0: "x" },
+        }),
+      ).toMatchObject({ ok: false, status: 409 })
+      const settled = await readQuestion(second.ctx, "form_1")
+      expect(settled).toMatchObject({ status: "answered", note: "form_already_settled" })
+      expect(settled?.answeredBy).toBeUndefined()
+    } finally {
+      conflict.stop(true)
+    }
+  })
+
+  it("recovers a settling marker that has no timestamp", async () => {
+    const test = harness()
+    const stored = test.storage.get(questionKey("form_1")) as Record<string, unknown>
+    test.storage.set(questionKey("form_1"), { ...stored, settlingBy: "ses_grand" })
+    const result = await answerQuestion(test.ctx, test.deps, {
+      actor: "ses_parent",
+      formID: "form_1",
+      answer: { q0: "x" },
+    })
+    expect(result.ok).toBe(true)
+    expect(test.replies).toHaveLength(1)
+  })
+
+  it("does not report success when the record was cancelled during the reply", async () => {
+    const test = harness()
+    test.ctx.session = {
+      form: {
+        reply: async () => {
+          const stored = test.storage.get(questionKey("form_1")) as Record<string, unknown>
+          test.storage.set(questionKey("form_1"), { ...stored, status: "cancelled" })
+        },
+      },
+    }
+    const result = await answerQuestion(test.ctx, test.deps, {
+      actor: "ses_parent",
+      formID: "form_1",
+      answer: { q0: "x" },
+    })
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining("cancelled") })
   })
 
 })

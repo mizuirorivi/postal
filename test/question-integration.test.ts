@@ -54,10 +54,12 @@ function harness() {
   const hooks: Record<string, (event: any) => void | Promise<void>> = {}
   const tools: Record<string, { execute: (input: any, context: any) => Promise<{ content: string }> }> = {}
   const replies: Array<{ sessionID: string; formID: string; answer: unknown }> = []
+  const cancels: Array<{ sessionID: string; formID: string; message?: string }> = []
   const events = eventStream()
   const rpc: Record<string, (input: any) => Promise<any>> = {}
+  const directory = `/tmp/postal-question-${Math.random().toString(36).slice(2)}`
   const context: any = {
-    location: { directory: `/tmp/postal-question-${Math.random().toString(36).slice(2)}` },
+    location: { directory },
     options: {},
     session: {
       hook: async (name: string, callback: (event: any) => void) => {
@@ -82,6 +84,9 @@ function harness() {
       form: {
         reply: async (input: { sessionID: string; formID: string; answer: unknown }) => {
           replies.push(input)
+        },
+        cancel: async (input: { sessionID: string; formID: string; message?: string }) => {
+          cancels.push(input)
         },
       },
     },
@@ -123,7 +128,7 @@ function harness() {
     },
   }
   const addSession = (id: string, title: string) => sessions.set(id, { id, title })
-  return { context, storage, prompts, hooks, tools, replies, events, rpc, addSession }
+  return { context, storage, prompts, hooks, tools, replies, events, rpc, addSession, directory, cancels }
 }
 
 async function boot() {
@@ -137,9 +142,10 @@ async function boot() {
   return { ...test, cleanup }
 }
 
-function questionEvent(id: string, kind = "question") {
+function questionEvent(id: string, directory: string, kind = "question") {
   return {
     type: "form.created",
+    location: { directory },
     data: {
       form: {
         id,
@@ -185,7 +191,7 @@ describe("question envelope and bridge", () => {
 
   it("forwards form.created, answers with postal_answer, and stops on cleanup", async () => {
     const test = await boot()
-    test.events.push(questionEvent("form_1"))
+    test.events.push(questionEvent("form_1", test.directory))
     await flush()
     expect(test.prompts).toHaveLength(1)
     expect(test.prompts[0]).toMatchObject({ sessionID: "ses_parent", delivery: "steer" })
@@ -204,28 +210,29 @@ describe("question envelope and bridge", () => {
 
     test.events.push({
       type: "form.replied",
+      location: { directory: test.directory },
       data: { id: "form_1", sessionID: "ses_child", answer: { q0: "postgres" } },
     })
     await flush()
     expect(test.prompts).toHaveLength(1)
 
-    test.events.push(questionEvent("form_2"))
+    test.events.push(questionEvent("form_2", test.directory))
     await flush()
-    test.events.push({ type: "form.cancelled", data: { id: "form_2", sessionID: "ses_child" } })
+    test.events.push({ type: "form.cancelled", location: { directory: test.directory }, data: { id: "form_2", sessionID: "ses_child" } })
     await flush()
     expect(test.prompts).toHaveLength(3)
     expect(test.prompts.at(-1)?.metadata?.postal?.kind).toBe("status")
 
     const before = test.prompts.length
     test.cleanup?.()
-    test.events.push(questionEvent("form_3"))
+    test.events.push(questionEvent("form_3", test.directory))
     await flush()
     expect(test.prompts).toHaveLength(before)
   })
 
   it("ignores non-question forms and denies a child answering its own question", async () => {
     const test = await boot()
-    test.events.push(questionEvent("form_1", "mcp"))
+    test.events.push(questionEvent("form_1", test.directory, "mcp"))
     await flush()
     expect(test.prompts).toHaveLength(0)
 
@@ -248,14 +255,36 @@ describe("question envelope and bridge", () => {
   })
   it("skips cross-location events and over-limit question letters", async () => {
     const test = await boot()
-    test.events.push({ ...questionEvent("form_loc"), location: { directory: "/elsewhere" } })
+    test.events.push({ ...questionEvent("form_loc", test.directory), location: { directory: "/elsewhere" } })
     await flush()
     expect(test.prompts).toHaveLength(0)
 
     test.storage.set("rally/ses_child:ses_parent", { count: 30, at: Date.now() })
-    test.events.push(questionEvent("form_rally"))
+    test.events.push(questionEvent("form_rally", test.directory))
     await flush()
     expect(test.prompts).toHaveLength(0)
+    expect(test.cancels).toHaveLength(1)
+    expect(test.cancels[0]).toMatchObject({ formID: "form_rally" })
+    test.cleanup?.()
+  })
+
+  it("ignores events without a location", async () => {
+    const test = await boot()
+    const warnings: string[] = []
+    const originalWarn = console.warn
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.join(" "))
+    }
+    try {
+      const event: any = questionEvent("form_noloc", test.directory)
+      delete event.location
+      test.events.push(event)
+      await flush()
+      expect(test.prompts).toHaveLength(0)
+      expect(warnings.join("\n")).toContain("without a location")
+    } finally {
+      console.warn = originalWarn
+    }
     test.cleanup?.()
   })
 
