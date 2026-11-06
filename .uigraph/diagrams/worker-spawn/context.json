@@ -1,35 +1,661 @@
 {
-  "name": "Worker Spawn Context",
-  "description": "postal_spawn creates an OpenCode session, optionally pairs it, and returns its ID for postal_send.",
   "nodes": {
-    "participant-A": {
+    "sequence-block-block-0": {
+      "type": "group",
+      "name": "alt autoPair enabled",
+      "style": {
+        "width": 1528,
+        "height": 244
+      },
+      "___internal": {
+        "source": "mermaid",
+        "backgroundColor": "rgba(99, 102, 241, 0.06)",
+        "borderColor": "#6366F1",
+        "autoLayout": false,
+        "sequenceBlock": {
+          "type": "alt",
+          "label": "autoPair enabled",
+          "depth": 0,
+          "startRow": 5,
+          "endRow": 7,
+          "sections": [
+            {
+              "label": "autoPair enabled",
+              "startRow": 5,
+              "endRow": 7
+            }
+          ]
+        }
+      },
+      "___position": {
+        "x": 136,
+        "y": 372
+      }
+    },
+    "participant-CallerAI": {
+      "type": "sequenceParticipant",
       "name": "Caller AI",
       "data": {
-        "Role": { "type": "Text Input", "value": "Calls postal_spawn and then sends work" }
+        "Role": {
+          "type": "Text Input",
+          "value": "Calls postal_spawn and then sends work"
+        }
+      },
+      "___internal": {
+        "source": "mermaid",
+        "participantType": "participant",
+        "rowCount": 10,
+        "rowHeight": 64,
+        "rowYs": [
+          72,
+          136,
+          200,
+          264,
+          328,
+          440,
+          504,
+          568,
+          648,
+          712
+        ],
+        "lifelineHeight": 744,
+        "activations": [],
+        "links": [],
+        "label": "Caller AI"
+      },
+      "___position": {
+        "x": 175,
+        "y": 0
       }
     },
-    "participant-P": {
+    "participant-postal_spawnTool": {
+      "type": "sequenceParticipant",
       "name": "postal_spawn Tool",
       "data": {
-        "Functions": { "type": "Text Input", "value": "parseModel, session.create, pair" }
+        "Functions": {
+          "type": "Text Input",
+          "value": "parseModel, session.create, pair"
+        }
+      },
+      "___internal": {
+        "source": "mermaid",
+        "participantType": "participant",
+        "rowCount": 10,
+        "rowHeight": 64,
+        "rowYs": [
+          72,
+          136,
+          200,
+          264,
+          328,
+          440,
+          504,
+          568,
+          648,
+          712
+        ],
+        "lifelineHeight": 744,
+        "activations": [],
+        "links": [],
+        "label": "postal_spawn Tool"
+      },
+      "___position": {
+        "x": 535,
+        "y": 0
       }
     },
-    "participant-O": {
+    "participant-OpenCodeRuntime": {
+      "type": "sequenceParticipant",
       "name": "OpenCode Runtime",
       "data": {
-        "API": { "type": "Text Input", "value": "ctx.session.create" }
+        "API": {
+          "type": "Text Input",
+          "value": "ctx.session.create"
+        }
+      },
+      "___internal": {
+        "source": "mermaid",
+        "participantType": "participant",
+        "rowCount": 10,
+        "rowHeight": 64,
+        "rowYs": [
+          72,
+          136,
+          200,
+          264,
+          328,
+          440,
+          504,
+          568,
+          648,
+          712
+        ],
+        "lifelineHeight": 744,
+        "activations": [],
+        "links": [],
+        "label": "OpenCode Runtime"
+      },
+      "___position": {
+        "x": 955.449035907845,
+        "y": 0
       }
     },
-    "participant-K": {
+    "participant-PluginKV": {
+      "type": "sequenceParticipant",
       "name": "Plugin KV",
       "data": {
-        "Keys": { "type": "Text Input", "value": "peers/<sessionID>" }
+        "Keys": {
+          "type": "Text Input",
+          "value": "peers/<sessionID>"
+        }
+      },
+      "___internal": {
+        "source": "mermaid",
+        "participantType": "participant",
+        "rowCount": 10,
+        "rowHeight": 64,
+        "rowYs": [
+          72,
+          136,
+          200,
+          264,
+          328,
+          440,
+          504,
+          568,
+          648,
+          712
+        ],
+        "lifelineHeight": 744,
+        "activations": [],
+        "links": [],
+        "label": "Plugin KV"
+      },
+      "___position": {
+        "x": 1255,
+        "y": 0
       }
     },
-    "participant-W": {
+    "participant-WorkerSession": {
+      "type": "sequenceParticipant",
       "name": "Worker Session",
       "data": {
-        "State": { "type": "Text Input", "value": "Idle until a letter arrives" }
+        "State": {
+          "type": "Text Input",
+          "value": "Idle until a letter arrives"
+        }
+      },
+      "___internal": {
+        "source": "mermaid",
+        "participantType": "participant",
+        "rowCount": 10,
+        "rowHeight": 64,
+        "rowYs": [
+          72,
+          136,
+          200,
+          264,
+          328,
+          440,
+          504,
+          568,
+          648,
+          712
+        ],
+        "lifelineHeight": 744,
+        "activations": [],
+        "links": [],
+        "label": "Worker Session"
+      },
+      "___position": {
+        "x": 1615,
+        "y": 0
+      }
+    },
+    "note-8": {
+      "type": "shape",
+      "name": "use postal_send to assign work",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 48,
+        "fill": "#FEF3C7",
+        "stroke": "#F59E0B",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "textColor": "#1F2937",
+        "sequenceNote": {
+          "placement": "left of",
+          "participants": [
+            "A"
+          ],
+          "row": 9
+        }
+      },
+      "___position": {
+        "x": 4.738195166069801,
+        "y": 688
+      }
+    },
+    "message-0": {
+      "type": "shape",
+      "name": "postal_spawn with options",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 48,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 1
+      },
+      "___position": {
+        "x": 290,
+        "y": 48
+      }
+    },
+    "message-1": {
+      "type": "shape",
+      "name": "parse model and permissions",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 48,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 2
+      },
+      "___position": {
+        "x": 588,
+        "y": 112
+      }
+    },
+    "message-2": {
+      "type": "shape",
+      "name": "session.create",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 32,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 3
+      },
+      "___position": {
+        "x": 680.2245179539225,
+        "y": 248
+      }
+    },
+    "message-3": {
+      "type": "shape",
+      "name": "new ses_ id",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 32,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 4
+      },
+      "___position": {
+        "x": 680.2245179539225,
+        "y": 312
+      }
+    },
+    "message-4": {
+      "type": "shape",
+      "name": "add peers both sides",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 48,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 5
+      },
+      "___position": {
+        "x": 830,
+        "y": 416
+      }
+    },
+    "message-5": {
+      "type": "shape",
+      "name": "refresh peer note",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 48,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 6
+      },
+      "___position": {
+        "x": 290,
+        "y": 480
+      }
+    },
+    "message-6": {
+      "type": "shape",
+      "name": "refresh peer note",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 48,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 7
+      },
+      "___position": {
+        "x": 1010,
+        "y": 544
+      }
+    },
+    "message-7": {
+      "type": "shape",
+      "name": "spawned id and status",
+      "shape": "rectangle",
+      "style": {
+        "width": 140,
+        "height": 48,
+        "fill": "#1E293B",
+        "stroke": "#475569",
+        "strokeWidth": 1
+      },
+      "___internal": {
+        "source": "mermaid",
+        "sequenceNumber": 8
+      },
+      "___position": {
+        "x": 290,
+        "y": 624
+      }
+    },
+    "sequence-title": {
+      "type": "text",
+      "value": "Worker spawn",
+      "___internal": {
+        "source": "mermaid"
+      },
+      "___position": {
+        "x": 0,
+        "y": -70
+      }
+    }
+  },
+  "edges": {
+    "participant-CallerAI-message-0": {
+      "type": "smoothstep",
+      "sourceHandle": "row-0-right-source",
+      "targetHandle": "target-left",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-0-participant-postal_spawnTool": {
+      "type": "smoothstep",
+      "sourceHandle": "source-right",
+      "targetHandle": "row-0-left-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "participant-postal_spawnTool-message-1": {
+      "type": "smoothstep",
+      "sourceHandle": "row-1-right-source",
+      "targetHandle": "target-top",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled",
+        "parallelOffset": -14
+      }
+    },
+    "message-1-participant-postal_spawnTool": {
+      "type": "smoothstep",
+      "sourceHandle": "source-bottom",
+      "targetHandle": "row-2-right-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled",
+        "parallelOffset": 14
+      }
+    },
+    "participant-postal_spawnTool-message-2": {
+      "type": "smoothstep",
+      "sourceHandle": "row-3-right-source",
+      "targetHandle": "target-left",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-2-participant-OpenCodeRuntime": {
+      "type": "smoothstep",
+      "sourceHandle": "source-right",
+      "targetHandle": "row-3-left-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "participant-OpenCodeRuntime-message-3": {
+      "type": "smoothstep",
+      "sourceHandle": "row-4-left-source",
+      "targetHandle": "target-right",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2,
+        "strokeStyle": "dashed"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-3-participant-postal_spawnTool": {
+      "type": "smoothstep",
+      "sourceHandle": "source-left",
+      "targetHandle": "row-4-right-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2,
+        "strokeStyle": "dashed"
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "participant-postal_spawnTool-message-4": {
+      "type": "smoothstep",
+      "sourceHandle": "row-5-right-source",
+      "targetHandle": "target-left",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-4-participant-PluginKV": {
+      "type": "smoothstep",
+      "sourceHandle": "source-right",
+      "targetHandle": "row-5-left-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "participant-postal_spawnTool-message-5": {
+      "type": "smoothstep",
+      "sourceHandle": "row-6-left-source",
+      "targetHandle": "target-right",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-5-participant-CallerAI": {
+      "type": "smoothstep",
+      "sourceHandle": "source-left",
+      "targetHandle": "row-6-right-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "participant-postal_spawnTool-message-6": {
+      "type": "smoothstep",
+      "sourceHandle": "row-7-right-source",
+      "targetHandle": "target-left",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-6-participant-WorkerSession": {
+      "type": "smoothstep",
+      "sourceHandle": "source-right",
+      "targetHandle": "row-7-left-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "participant-postal_spawnTool-message-7": {
+      "type": "smoothstep",
+      "sourceHandle": "row-8-left-source",
+      "targetHandle": "target-right",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2,
+        "strokeStyle": "dashed"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
+      }
+    },
+    "message-7-participant-CallerAI": {
+      "type": "smoothstep",
+      "sourceHandle": "source-left",
+      "targetHandle": "row-8-right-target",
+      "style": {
+        "stroke": "#94a3b8",
+        "strokeWidth": 2,
+        "strokeStyle": "dashed"
+      },
+      "markerEnd": {
+        "type": "arrowclosed",
+        "color": "#94a3b8"
+      },
+      "___internal": {
+        "source": "mermaid",
+        "arrowType": "filled"
       }
     }
   }
